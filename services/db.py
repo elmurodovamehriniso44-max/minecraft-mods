@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,10 @@ class Database:
                 title      TEXT,
                 artist     TEXT,
                 created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
             );
             CREATE TABLE IF NOT EXISTS links (
                 url       TEXT PRIMARY KEY,
@@ -108,6 +113,37 @@ class Database:
             "INSERT OR REPLACE INTO links (url, track_key) VALUES (?,?)", (url, track_key)
         )
         await self.conn.commit()
+
+    # ---- settings ----
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        async with self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row["value"] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+        await self.conn.commit()
+
+    async def get_channels(self) -> list[str]:
+        raw = await self.get_setting("channels")
+        if raw is None:  # birinchi ishga tushish: .env dagi kanallar
+            await self.set_channels(list(config.CHANNELS))
+            return list(config.CHANNELS)
+        try:
+            return list(json.loads(raw))
+        except Exception:
+            return []
+
+    async def set_channels(self, channels: list[str]) -> None:
+        await self.set_setting("channels", json.dumps(channels))
+
+    async def clear_tracks(self) -> int:
+        async with self.conn.execute("SELECT COUNT(*) FROM tracks") as cur:
+            n = (await cur.fetchone())[0]
+        await self.conn.execute("DELETE FROM tracks")
+        await self.conn.execute("DELETE FROM links")
+        await self.conn.commit()
+        return n
 
 
 db = Database()

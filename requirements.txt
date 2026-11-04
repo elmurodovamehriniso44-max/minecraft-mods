@@ -1,5 +1,6 @@
 aiogram>=3.7,<4
-yt-dlp
+aiohttp
+yt-dlp[default]
 shazamio
 mutagen
 aiosqlite

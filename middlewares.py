@@ -24,7 +24,7 @@ class UserMiddleware(BaseMiddleware):
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if not config.CHANNELS or not user or user.id in config.ADMIN_IDS:
+        if not user or user.id in config.ADMIN_IDS or not await db.get_channels():
             return await handler(event, data)
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             return await handler(event, data)
