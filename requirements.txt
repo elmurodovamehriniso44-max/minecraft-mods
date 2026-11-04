@@ -1,5 +1,7 @@
-aiogram>=3.13,<4.0
-SQLAlchemy[asyncio]>=2.0.30,<2.1
-aiosqlite>=0.20
-asyncpg>=0.29
-python-dotenv>=1.0
+aiogram>=3.7,<4
+yt-dlp
+shazamio
+mutagen
+aiosqlite
+Pillow
+python-dotenv

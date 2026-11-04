@@ -1,44 +1,44 @@
-import hashlib
 import os
-from dataclasses import dataclass
+import shutil
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-@dataclass(frozen=True)
-class Config:
-    bot_token: str
-    admin_ids: list
-    database_url: str
-    webhook_base: str | None
-    port: int
-    webhook_secret: str
-    guide_video_url: str | None
+def _int_list(value: str) -> list[int]:
+    out: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.append(int(part))
+    return out
 
 
-def load_config() -> Config:
-    token = os.getenv("BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("BOT_TOKEN o'rnatilmagan!")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""))
+CHANNELS = ["@" + c.strip().lstrip("@") for c in os.getenv("CHANNELS", "").split(",") if c.strip()]
 
-    admin_ids = [
-        int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
-    ]
+_storage = os.getenv("STORAGE_CHAT_ID", "").strip()
+STORAGE_CHAT_ID = int(_storage) if _storage.lstrip("-").isdigit() else (ADMIN_IDS[0] if ADMIN_IDS else 0)
 
-    # Render avtomatik ravishda RENDER_EXTERNAL_URL beradi
-    base = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+DB_PATH = os.getenv("DB_PATH", "data/bot.db")
+TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/linkshazam"))
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    return Config(
-        bot_token=token,
-        admin_ids=admin_ids,
-        database_url=os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db"),
-        webhook_base=base.rstrip("/") if base else None,
-        port=int(os.getenv("PORT", "10000")),
-        webhook_secret=hashlib.sha256(token.encode()).hexdigest()[:32],
-        guide_video_url=os.getenv("GUIDE_VIDEO_URL") or None,
-    )
+MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))
+MAX_TRACK_SECONDS = 720      # yuboriladigan trek maksimal davomiyligi
+MAX_LINK_SECONDS = 900       # havoladagi video maksimal davomiyligi
+MAX_FILE_BYTES = 49 * 1024 * 1024  # Bot API yuklash limiti ~50 MB
 
+PROXY = os.getenv("PROXY", "").strip() or None
 
-config = load_config()
+# Render "Secret Files" faqat o'qish uchun bo'ladi, yt-dlp esa cookie faylga yozishga urinadi.
+# Shuning uchun nusxasini yozish mumkin bo'lgan joyga ko'chiramiz.
+COOKIES_FILE = None
+_src = os.getenv("COOKIES_FILE", "").strip()
+if _src and Path(_src).is_file():
+    _dst = TMP_DIR / "cookies.txt"
+    shutil.copyfile(_src, _dst)
+    COOKIES_FILE = str(_dst)

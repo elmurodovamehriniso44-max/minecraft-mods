@@ -1,77 +1,56 @@
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-import db
-import handlers_admin
-import handlers_user
-from config import config
-from keyboards import main_menu
-
-WEBHOOK_PATH = "/webhook"
+import config
+from handlers import admin, inline, music, start
+from middlewares import SubscriptionMiddleware, UserMiddleware
+from services.db import db
 
 
-async def health(request: web.Request) -> web.Response:
-    return web.Response(text="OK")
+async def start_health_server() -> web.AppRunner:
+    """Render Web Service port kutadi; shu uchun kichik health-check server."""
+    app = web.Application()
+    app.router.add_get("/", lambda _: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    return runner
 
 
-async def on_startup(bot: Bot):
-    if config.webhook_base:
-        await bot.set_webhook(
-            url=config.webhook_base + WEBHOOK_PATH,
-            secret_token=config.webhook_secret,
-            allowed_updates=["message", "callback_query"],
-        )
-        logging.info("Webhook o'rnatildi: %s", config.webhook_base + WEBHOOK_PATH)
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not config.BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN topilmadi (.env yoki environment variables)")
 
+    await db.init()
+    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
 
-def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
+    # Tartib muhim: avval foydalanuvchini yozamiz, keyin obunani tekshiramiz
+    for observer in (dp.message, dp.callback_query):
+        observer.outer_middleware(UserMiddleware())
+        observer.outer_middleware(SubscriptionMiddleware())
+    dp.inline_query.outer_middleware(UserMiddleware())
 
-    @dp.message(Command("cancel"))
-    async def cancel(m: Message, state: FSMContext):
-        await state.clear()
-        await m.answer("❌ Bekor qilindi.", reply_markup=main_menu())
+    dp.include_router(admin.router)
+    dp.include_router(start.router)
+    dp.include_router(inline.router)
+    dp.include_router(music.router)  # eng oxirida: umumiy matn handleri
 
-    dp.include_routers(handlers_admin.router, handlers_user.router)
-    dp.startup.register(on_startup)
-    return dp
-
-
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await db.init_db()
-
-    bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = build_dispatcher()
-
-    if config.webhook_base:
-        # Render / hosting: webhook + health-check
-        app = web.Application()
-        app.router.add_get("/", health)
-        app.router.add_get("/health", health)
-        SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=config.webhook_secret).register(
-            app, path=WEBHOOK_PATH
-        )
-        setup_application(app, dp, bot=bot)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", config.port).start()
-        logging.info("Server %s portda ishga tushdi", config.port)
-        await asyncio.Event().wait()
-    else:
-        # Mahalliy sinov: polling
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=True)
+    runner = await start_health_server()
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await runner.cleanup()
+        await db.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
