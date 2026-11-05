@@ -8,9 +8,11 @@ import asyncio
 import logging
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 
+from mutagen.mp3 import MP3
 from yt_dlp import YoutubeDL
 
 import config
@@ -22,6 +24,10 @@ class DownloadError(Exception):
     pass
 
 
+class PreviewError(DownloadError):
+    """Yuklangan fayl to'liq trek emas (odatda 30 soniyalik preview)."""
+
+
 _BAD_WORDS = (
     "live", "cover", "karaoke", "remix", "reaction", "slowed", "sped up", "speed up",
     "nightcore", "8d", "instrumental", "tutorial", "mashup",
@@ -30,6 +36,7 @@ _BAD_WORDS = (
 _sem: asyncio.Semaphore | None = None
 _cookie_lock = threading.Lock()
 _cookie_state: dict = {"resolved": False, "path": None}
+_last_ok: dict = {"client": "unset"}   # oxirgi ishlagan player_client — keyingi safar birinchi shu sinaladi
 
 
 # --- Yordamchilar -----------------------------------------------------------
@@ -70,10 +77,14 @@ def _base_opts(cookies: str | None) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "retries": 3,
+        "retries": 2,
+        "extractor_retries": 1,            # ishlamayotgan client'da vaqt yo'qotmaslik
         "fragment_retries": 3,
-        "socket_timeout": 20,
+        "socket_timeout": 15,
         "geo_bypass": True,
+        "noprogress": True,
+        "concurrent_fragment_downloads": 4,  # HLS/DASH bo'laklarini parallel tortish
+        "http_chunk_size": 10485760,         # YouTube throttling'ni kamaytiradi
     }
     if cookies:
         opts["cookiefile"] = cookies
@@ -145,6 +156,23 @@ def _search_urls(prefix: str, query: str, cookies: str | None, target: int | Non
     return [c["url"] for c in entries]
 
 
+def _check_full_length(mp3: Path, target: int | None) -> None:
+    """Fayl preview (30s) bo'lib qolmaganini tekshiradi."""
+    try:
+        length = float(MP3(str(mp3)).info.length)
+    except Exception:
+        return  # o'lchab bo'lmasa, to'sqinlik qilmaymiz
+    if target and target >= 45:
+        bad = length < target * 0.6      # kutilgan uzunlikning 60% idan kam
+    elif not target:
+        bad = length <= 35               # uzunlik noma'lum: 30s preview'larni rad etamiz
+    else:
+        bad = False                      # juda qisqa trek
+    if bad:
+        raise PreviewError(f"Fayl faqat {length:.0f}s (kutilgan ~{target or '?'}s) — preview, to'liq emas")
+    log.info("Uzunlik: %.0fs (kutilgan %ss)", length, target)
+
+
 def _cleanup(stem: str) -> None:
     for p in config.DOWNLOAD_DIR.glob(f"{stem}*"):
         try:
@@ -153,45 +181,59 @@ def _cleanup(stem: str) -> None:
             pass
 
 
-def _fetch(url: str, client: str | None, cookies: str | None) -> Path:
+def _fetch(url: str, client: str | None, cookies: str | None, target: int | None = None) -> Path:
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     stem = uuid.uuid4().hex[:12]
     opts = {
         **_base_opts(cookies),
-        "format": "bestaudio/best",
+        "format": "bestaudio[abr<=160]/bestaudio/best",  # kichik manba = tez yuklash va tez konvertatsiya
         "outtmpl": str(config.DOWNLOAD_DIR / f"{stem}.%(ext)s"),
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": config.AUDIO_QUALITY}
         ],
     }
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    t0 = time.monotonic()
     try:
         with YoutubeDL(opts) as ydl:
             ydl.download([url])
+        log.info("⏱ yt-dlp+ffmpeg: %.1fs (client=%s)", time.monotonic() - t0, client or "default")
         mp3 = config.DOWNLOAD_DIR / f"{stem}.mp3"
         if not mp3.exists():
             raise DownloadError("MP3 fayl hosil bo'lmadi (ffmpeg o'rnatilganmi?)")
         if mp3.stat().st_size > config.MAX_FILE_MB * 1024 * 1024:
             raise DownloadError(f"Fayl {config.MAX_FILE_MB} MB dan katta")
+        _check_full_length(mp3, target)
         return mp3
     except Exception:
         _cleanup(stem)
         raise
 
 
-def _try_url(url: str, cookies: str | None, errors: list[str]) -> Path | None:
+def _try_url(url: str, cookies: str | None, errors: list[str], target: int | None = None) -> Path | None:
     """Bitta URL'ni yuklashga urinadi. YouTube bo'lsa, player_client profillari ketma-ket sinaladi."""
     if _is_youtube(url):
-        for client in [*config.PLAYER_CLIENTS, None]:  # None = yt-dlp standarti
+        clients: list[str | None] = [*config.PLAYER_CLIENTS, None]  # None = yt-dlp standarti
+        last = _last_ok["client"]
+        if last != "unset" and last in clients:
+            clients.remove(last)
+            clients.insert(0, last)
+        for client in clients:
             try:
-                return _fetch(url, client, cookies)
+                path = _fetch(url, client, cookies, target)
+                _last_ok["client"] = client
+                return path
+            except PreviewError as e:
+                errors.append(f"YT preview: {e}")
+                log.warning("Preview/qisqa fayl (%s): %s", url, e)
+                break  # boshqa client'lar ham xuddi shuni beradi
             except Exception as e:
                 errors.append(f"YT[{client or 'default'}]: {str(e)[:150]}")
                 log.warning("YouTube yuklash xatosi (%s, %s): %s", client, url, e)
     else:
         try:
-            return _fetch(url, None, None)  # SoundCloud: YouTube cookies kerak emas
+            return _fetch(url, None, None, target)  # SoundCloud: YouTube cookies kerak emas
         except Exception as e:
             errors.append(f"SC: {str(e)[:150]}")
             log.warning("SoundCloud yuklash xatosi (%s): %s", url, e)
@@ -205,7 +247,7 @@ def _download_sync(query: str, duration_hint: int | None, url: str | None) -> Pa
 
     # 0) Foydalanuvchi aniq variant tanlagan bo'lsa, avval o'sha URL
     if url:
-        path = _try_url(url, cookies, errors)
+        path = _try_url(url, cookies, errors, duration_hint)
         if path:
             return path
 
@@ -216,7 +258,7 @@ def _download_sync(query: str, duration_hint: int | None, url: str | None) -> Pa
         errors.append(f"YT qidiruv: {e}")
         yt_urls = []
     for u in [x for x in yt_urls if x != url][:2]:
-        path = _try_url(u, cookies, errors)
+        path = _try_url(u, cookies, errors, duration_hint)
         if path:
             return path
 
@@ -227,7 +269,7 @@ def _download_sync(query: str, duration_hint: int | None, url: str | None) -> Pa
         errors.append(f"SC qidiruv: {e}")
         sc_urls = []
     for u in [x for x in sc_urls if x != url][:3]:
-        path = _try_url(u, None, errors)
+        path = _try_url(u, None, errors, duration_hint)
         if path:
             return path
 

@@ -55,6 +55,7 @@ COOKIES_CANDIDATES = [p for p in (
 COOKIES_RUNTIME = DATA_DIR / "cookies_runtime.txt"  # yt-dlp yozishi mumkin, shuning uchun nusxa ishlatiladi
 
 PLAYER_CLIENTS = [c.strip() for c in _env("YT_PLAYER_CLIENTS", "android,web,ios").split(",") if c.strip()]
+AUDIO_QUALITY = _env("AUDIO_QUALITY", "128")        # MP3 bitrate (kbps): past = tezroq va yengilroq
 MAX_FILE_MB = int(_env("MAX_FILE_MB", "49"))        # Bot API limiti: 50 MB
 MAX_DURATION = int(_env("MAX_DURATION", "1200"))    # soniya (20 daqiqadan uzun videolar o'tkazib yuboriladi)
 MAX_PARALLEL_DOWNLOADS = int(_env("MAX_PARALLEL_DOWNLOADS", "2"))

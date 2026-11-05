@@ -58,9 +58,18 @@ async def send_track(bot: Bot, chat_id: int, user_id: int, track: TrackInfo,
             return msg
 
         query = f"{track.artist} - {track.title}" if track.artist else track.title
-        path = await downloader.download_audio(query, track.duration_s, url=source_url)
+        t0 = time.monotonic()
+        # Muqova audio bilan parallel yuklanadi (vaqt tejaladi)
+        cover_task = asyncio.create_task(utils.download_bytes(track.cover_url)) if track.cover_url else None
         try:
-            cover = await utils.download_bytes(track.cover_url) if track.cover_url else None
+            path = await downloader.download_audio(query, track.duration_s, url=source_url)
+        except BaseException:
+            if cover_task:
+                cover_task.cancel()
+            raise
+        t1 = time.monotonic()
+        try:
+            cover = await cover_task if cover_task else None
             await asyncio.to_thread(tagger.tag_mp3, path, track.title, track.artist or None, track.album, cover)
             duration = await asyncio.to_thread(tagger.get_duration, path) or track.duration_s
             thumb = BufferedInputFile(cover, "cover.jpg") if cover and len(cover) < 200 * 1024 else None
@@ -74,6 +83,8 @@ async def send_track(bot: Bot, chat_id: int, user_id: int, track: TrackInfo,
                 thumbnail=thumb,
                 caption=await utils.bot_caption(bot),
             )
+            log.info("⏱ '%s': yuklash+konvertatsiya %.1fs, Telegramga yuborish %.1fs",
+                     track.display[:50], t1 - t0, time.monotonic() - t1)
             track_id = await db.save_track(
                 cache_key=track.cache_key or utils.normalize_key(track.title),
                 spotify_id=track.spotify_id, artist=track.artist, title=track.title,
