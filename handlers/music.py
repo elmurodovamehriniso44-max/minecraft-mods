@@ -1,9 +1,6 @@
-"""Spotify havola tahlili, matnli qidiruv (24 variant, 3 bo'lim), yuklash va callback'lar."""
+"""Spotify havola tahlili, matnli qidiruv (10 variant), yuklash va callback'lar."""
 import asyncio
 import logging
-import math
-import time
-import uuid
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
@@ -21,12 +18,9 @@ from services.spotifier import SpotifyError, TrackInfo
 log = logging.getLogger(__name__)
 router = Router(name="music")
 
-TOTAL_RESULTS = 24      # jami variantlar
-PAGE_SIZE = 8           # 24 / 8 = 3 ta bo'lim
-SESSION_TTL = 3600      # qidiruv natijalari 1 soat saqlanadi
+TOTAL_RESULTS = 10     # Spotify bitta so'rovda maksimum 10 ta natija beradi
 
 _locks: dict[str, asyncio.Lock] = {}   # bir xil trek ikki marta yuklanmasligi uchun
-_searches: dict[str, dict] = {}        # sid -> {"query", "items", "yt", "ts"}
 _album_busy: set[int] = set()
 
 
@@ -125,42 +119,13 @@ async def deliver(bot: Bot, chat_id: int, user_id: int, track: TrackInfo,
 
 
 # =============================================================================
-#  Qidiruv sessiyasi va bo'limlarga bo'lingan klaviatura
+#  Natijalar klaviaturasi
 # =============================================================================
-def _cleanup_sessions() -> None:
-    now = time.time()
-    for sid in [k for k, v in _searches.items() if now - v["ts"] > SESSION_TTL]:
-        _searches.pop(sid, None)
-    while len(_searches) > 300:
-        _searches.pop(next(iter(_searches)))
-
-
-def _page_text(sess: dict, page: int) -> str:
-    pages = max(1, math.ceil(len(sess["items"]) / PAGE_SIZE))
-    return (
-        f"🔎 <b>«{utils.truncate(sess['query'], 50)}»</b> — {len(sess['items'])} ta natija\n"
-        f"📑 Bo'lim: <b>{page + 1}/{pages}</b>\n"
-        "<i>⚡ — tayyor (darhol yuboriladi)</i>\n\n"
-        "Kerakli variantni tanlang 👇"
-    )
-
-
-def _page_kb(sid: str, sess: dict, page: int) -> InlineKeyboardMarkup:
-    items = sess["items"]
-    pages = max(1, math.ceil(len(items) / PAGE_SIZE))
-    start = page * PAGE_SIZE
+def _results_kb(items: list[dict]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for i, item in enumerate(items[start:start + PAGE_SIZE], start + 1):
+    for i, item in enumerate(items, 1):
         kb.button(text=utils.truncate(f"{i}. {item['label']}", 60), callback_data=item["data"])
     kb.adjust(1)
-
-    nav = InlineKeyboardBuilder()
-    if page > 0:
-        nav.button(text="⬅️ Oldingi", callback_data=f"pg:{sid}:{page - 1}")
-    nav.button(text=f"📑 {page + 1}/{pages}", callback_data="noop")
-    if page < pages - 1:
-        nav.button(text="Keyingi ➡️", callback_data=f"pg:{sid}:{page + 1}")
-    kb.attach(nav)
     return kb.as_markup()
 
 
@@ -247,18 +212,11 @@ async def _handle_album_link(message: Message, sid: str):
 async def _handle_search(message: Message, text: str):
     status = await message.answer("🔎 Qidirilmoqda…")
 
-    # 1) Bazadagi tayyor (kesh) treklar
-    cached = await db.search_tracks(text, 6)
-
-    # 2) Spotify: 3 ta so'rov (8 tadan, offset 0/8/16) parallel
-    spot = await asyncio.gather(
-        *(spotifier.search(text, PAGE_SIZE, offset=o) for o in range(0, TOTAL_RESULTS, PAGE_SIZE)),
-        return_exceptions=True,
-    )
-    found: list[TrackInfo] = []
-    for r in spot:
-        if isinstance(r, list):
-            found.extend(r)
+    cached = await db.search_tracks(text, 5)           # bazadagi tayyor treklar
+    try:
+        found = await spotifier.search(text, TOTAL_RESULTS)
+    except SpotifyError:
+        found = []
 
     items: list[dict] = []
     seen_ids: set[str] = set()
@@ -273,81 +231,25 @@ async def _handle_search(message: Message, text: str):
             break
         if t.spotify_id in seen_ids or t.cache_key in seen_keys:
             continue
-        seen_ids.add(t.spotify_id)
-        seen_keys.add(t.cache_key)
         dur = utils.fmt_duration(t.duration_s)
         items.append({"label": f"🎵 {t.display}" + (f" ({dur})" if dur else ""), "data": f"dl:{t.spotify_id}"})
 
-    # 3) Yetmasa — YouTube/SoundCloud variantlari bilan to'ldiramiz
-    sid = uuid.uuid4().hex[:8]
-    yt_map: dict[int, dict] = {}
-    if len(items) < TOTAL_RESULTS:
-        try:
-            cands = await downloader.search_candidates(text, TOTAL_RESULTS - len(items) + 4)
-        except Exception as e:
-            log.warning("Zaxira qidiruv xatosi: %s", e)
-            cands = []
-        for c in cands:
-            if len(items) >= TOTAL_RESULTS:
-                break
-            idx = len(yt_map)
-            yt_map[idx] = c
-            dur = utils.fmt_duration(c["duration"])
-            icon = "▶️" if c["source"] == "youtube" else "☁️"
-            items.append({"label": f"{icon} {c['title']}" + (f" ({dur})" if dur else ""),
-                          "data": f"yt:{sid}:{idx}"})
-
     if not items:
-        # Hech narsa topilmadi -> to'g'ridan-to'g'ri urinib ko'ramiz
+        # Spotify'da topilmadi yoki ishlamayapti -> to'g'ridan-to'g'ri qidirib yuklaymiz
         await status.edit_text(f"⏳ <b>{utils.truncate(text, 80)}</b> to'g'ridan-to'g'ri qidirilmoqda…")
         await deliver(message.bot, message.chat.id, message.from_user.id, TrackInfo(None, "", text), status)
         return
 
-    _cleanup_sessions()
-    sess = {"query": text, "items": items, "yt": yt_map, "ts": time.time()}
-    _searches[sid] = sess
-    await status.edit_text(_page_text(sess, 0), reply_markup=_page_kb(sid, sess, 0))
+    await status.edit_text(
+        f"🔎 <b>«{utils.truncate(text, 60)}»</b> bo'yicha natijalar:\n"
+        "<i>⚡ — tayyor (darhol yuboriladi)</i>",
+        reply_markup=_results_kb(items),
+    )
 
 
 # =============================================================================
 #  Callback'lar
 # =============================================================================
-@router.callback_query(F.data == "noop")
-async def cb_noop(call: CallbackQuery):
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("pg:"))
-async def cb_page(call: CallbackQuery):
-    _, sid, page_s = call.data.split(":")
-    sess = _searches.get(sid)
-    if not sess:
-        await call.answer("Natijalar eskirgan, qayta qidiring.", show_alert=True)
-        return
-    page = max(0, min(int(page_s), math.ceil(len(sess["items"]) / PAGE_SIZE) - 1))
-    try:
-        await call.message.edit_text(_page_text(sess, page), reply_markup=_page_kb(sid, sess, page))
-    except TelegramBadRequest:
-        pass  # "message is not modified"
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("yt:"))
-async def cb_youtube(call: CallbackQuery, bot: Bot):
-    """Ro'yxatdagi YouTube/SoundCloud varianti tanlandi -> aynan o'sha variant yuklanadi va yuboriladi."""
-    _, sid, idx = call.data.split(":")
-    sess = _searches.get(sid)
-    cand = sess["yt"].get(int(idx)) if sess else None
-    if not cand:
-        await call.answer("Natijalar eskirgan, qayta qidiring.", show_alert=True)
-        return
-    await call.answer("⏳ Yuklanmoqda…")
-    chat_id = call.message.chat.id if call.message else call.from_user.id
-    track = TrackInfo(None, "", cand["title"], duration_ms=(cand["duration"] or 0) * 1000 or None)
-    status = await bot.send_message(chat_id, f"⏳ <b>{utils.truncate(track.title, 80)}</b> tayyorlanmoqda…")
-    await deliver(bot, chat_id, call.from_user.id, track, status, source_url=cand["url"])
-
-
 async def _edit_inline_audio(bot: Bot, inline_id: str, file_id: str) -> None:
     """Inline xabarni audio bilan almashtiradi (faqat file_id orqali mumkin)."""
     try:
