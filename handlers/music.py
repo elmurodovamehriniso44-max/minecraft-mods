@@ -1,6 +1,8 @@
 """Spotify havola tahlili, matnli qidiruv (10 variant), yuklash va callback'lar."""
 import asyncio
 import logging
+import time
+import uuid
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
@@ -22,6 +24,7 @@ TOTAL_RESULTS = 10     # Spotify bitta so'rovda maksimum 10 ta natija beradi
 
 _locks: dict[str, asyncio.Lock] = {}   # bir xil trek ikki marta yuklanmasligi uchun
 _album_busy: set[int] = set()
+_yt_results: dict[str, dict] = {}      # sid -> {"ts": vaqt, "items": {idx: variant}}
 
 
 # =============================================================================
@@ -234,8 +237,39 @@ async def _handle_search(message: Message, text: str):
         dur = utils.fmt_duration(t.duration_s)
         items.append({"label": f"🎵 {t.display}" + (f" ({dur})" if dur else ""), "data": f"dl:{t.spotify_id}"})
 
+    # Spotify yetarli natija bermasa (yoki ishlamasa) — YouTube/SoundCloud variantlari bilan to'ldiramiz
+    sid = uuid.uuid4().hex[:8]
+    yt_map: dict[int, dict] = {}
+    if len(items) < TOTAL_RESULTS:
+        try:
+            cands = await downloader.search_candidates(text, TOTAL_RESULTS - len(items) + 6)
+        except Exception as e:
+            log.warning("Zaxira qidiruv xatosi: %s", e)
+            cands = []
+        seen_titles: set[str] = set()
+        for c in cands:
+            if len(items) >= TOTAL_RESULTS:
+                break
+            key = utils.normalize_key(c["title"])
+            if key in seen_titles or key in seen_keys:
+                continue
+            seen_titles.add(key)
+            idx = len(yt_map)
+            yt_map[idx] = c
+            dur = utils.fmt_duration(c["duration"])
+            icon = "▶️" if c["source"] == "youtube" else "☁️"
+            items.append({"label": f"{icon} {c['title']}" + (f" ({dur})" if dur else ""),
+                          "data": f"yt:{sid}:{idx}"})
+        if yt_map:
+            now = time.time()
+            for k in [k for k, v in _yt_results.items() if now - v["ts"] > 3600]:
+                _yt_results.pop(k, None)
+            while len(_yt_results) > 300:
+                _yt_results.pop(next(iter(_yt_results)))
+            _yt_results[sid] = {"ts": now, "items": yt_map}
+
     if not items:
-        # Spotify'da topilmadi yoki ishlamayapti -> to'g'ridan-to'g'ri qidirib yuklaymiz
+        # Hech qayerdan variant topilmadi -> to'g'ridan-to'g'ri qidirib yuklaymiz
         await status.edit_text(f"⏳ <b>{utils.truncate(text, 80)}</b> to'g'ridan-to'g'ri qidirilmoqda…")
         await deliver(message.bot, message.chat.id, message.from_user.id, TrackInfo(None, "", text), status)
         return
@@ -250,6 +284,21 @@ async def _handle_search(message: Message, text: str):
 # =============================================================================
 #  Callback'lar
 # =============================================================================
+@router.callback_query(F.data.startswith("yt:"))
+async def cb_youtube(call: CallbackQuery, bot: Bot):
+    """Ro'yxatdagi variant tanlandi -> aynan o'sha variant yuklanadi va yuboriladi."""
+    _, sid, idx = call.data.split(":")
+    cand = (_yt_results.get(sid) or {}).get("items", {}).get(int(idx))
+    if not cand:
+        await call.answer("Natijalar eskirgan, qayta qidiring.", show_alert=True)
+        return
+    await call.answer("⏳ Yuklanmoqda…")
+    chat_id = call.message.chat.id if call.message else call.from_user.id
+    track = TrackInfo(None, "", cand["title"], duration_ms=(cand["duration"] or 0) * 1000 or None)
+    status = await bot.send_message(chat_id, f"⏳ <b>{utils.truncate(track.title, 80)}</b> tayyorlanmoqda…")
+    await deliver(bot, chat_id, call.from_user.id, track, status, source_url=cand["url"])
+
+
 async def _edit_inline_audio(bot: Bot, inline_id: str, file_id: str) -> None:
     """Inline xabarni audio bilan almashtiradi (faqat file_id orqali mumkin)."""
     try:

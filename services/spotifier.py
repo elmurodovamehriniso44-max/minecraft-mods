@@ -123,8 +123,8 @@ async def get_album(spotify_id: str) -> AlbumInfo:
     )
 
 
-async def search(query: str, limit: int = 8) -> list[TrackInfo]:
+async def search(query: str, limit: int = 8, offset: int = 0) -> list[TrackInfo]:
     data = await asyncio.to_thread(
-        _wrap, lambda: _sp().search(q=query, type="track", limit=min(limit, 10))
+        _wrap, lambda: _sp().search(q=query, type="track", limit=min(limit, 10), offset=offset)
     )
     return [_to_track(t) for t in data.get("tracks", {}).get("items", []) if t and t.get("id")]
