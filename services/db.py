@@ -1,149 +1,172 @@
-import json
+import os
+import re
 import time
-from pathlib import Path
-from typing import Optional
 
 import aiosqlite
 
 import config
 
-
-class Database:
-    def __init__(self) -> None:
-        self.conn: Optional[aiosqlite.Connection] = None
-
-    async def init(self) -> None:
-        Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = await aiosqlite.connect(config.DB_PATH)
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.executescript(
-            """
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                full_name   TEXT,
-                joined_at   INTEGER NOT NULL,
-                last_active INTEGER NOT NULL,
-                blocked     INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS tracks (
-                key        TEXT PRIMARY KEY,
-                file_id    TEXT NOT NULL,
-                title      TEXT,
-                artist     TEXT,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-            CREATE TABLE IF NOT EXISTS links (
-                url       TEXT PRIMARY KEY,
-                track_key TEXT NOT NULL
-            );
-            """
-        )
-        await self.conn.commit()
-
-    async def close(self) -> None:
-        if self.conn:
-            await self.conn.close()
-
-    # ---- users ----
-    async def upsert_user(self, user_id: int, username: Optional[str], full_name: str) -> None:
-        now = int(time.time())
-        await self.conn.execute(
-            """
-            INSERT INTO users (user_id, username, full_name, joined_at, last_active, blocked)
-            VALUES (?, ?, ?, ?, ?, 0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                full_name=excluded.full_name,
-                last_active=excluded.last_active,
-                blocked=0
-            """,
-            (user_id, username, full_name, now, now),
-        )
-        await self.conn.commit()
-
-    async def all_user_ids(self) -> list[int]:
-        async with self.conn.execute("SELECT user_id FROM users WHERE blocked=0") as cur:
-            return [r["user_id"] for r in await cur.fetchall()]
-
-    async def mark_blocked(self, user_id: int) -> None:
-        await self.conn.execute("UPDATE users SET blocked=1 WHERE user_id=?", (user_id,))
-        await self.conn.commit()
-
-    async def stats(self) -> dict:
-        day_ago = int(time.time()) - 86400
-        q = {
-            "total": "SELECT COUNT(*) FROM users",
-            "blocked": "SELECT COUNT(*) FROM users WHERE blocked=1",
-            "active_24h": f"SELECT COUNT(*) FROM users WHERE last_active>{day_ago}",
-            "new_24h": f"SELECT COUNT(*) FROM users WHERE joined_at>{day_ago}",
-            "tracks": "SELECT COUNT(*) FROM tracks",
-        }
-        out = {}
-        for name, sql in q.items():
-            async with self.conn.execute(sql) as cur:
-                out[name] = (await cur.fetchone())[0]
-        return out
-
-    # ---- tracks cache ----
-    async def get_track(self, key: str) -> Optional[dict]:
-        async with self.conn.execute("SELECT * FROM tracks WHERE key=?", (key,)) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-    async def save_track(self, key: str, file_id: str, title: str, artist: str) -> None:
-        await self.conn.execute(
-            "INSERT OR REPLACE INTO tracks (key, file_id, title, artist, created_at) VALUES (?,?,?,?,?)",
-            (key, file_id, title, artist, int(time.time())),
-        )
-        await self.conn.commit()
-
-    async def get_link(self, url: str) -> Optional[str]:
-        async with self.conn.execute("SELECT track_key FROM links WHERE url=?", (url,)) as cur:
-            row = await cur.fetchone()
-            return row["track_key"] if row else None
-
-    async def save_link(self, url: str, track_key: str) -> None:
-        await self.conn.execute(
-            "INSERT OR REPLACE INTO links (url, track_key) VALUES (?,?)", (url, track_key)
-        )
-        await self.conn.commit()
-
-    # ---- settings ----
-    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        async with self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
-            row = await cur.fetchone()
-            return row["value"] if row else default
-
-    async def set_setting(self, key: str, value: str) -> None:
-        await self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
-        await self.conn.commit()
-
-    async def get_channels(self) -> list[str]:
-        raw = await self.get_setting("channels")
-        if raw is None:  # birinchi ishga tushish: .env dagi kanallar
-            await self.set_channels(list(config.CHANNELS))
-            return list(config.CHANNELS)
-        try:
-            return list(json.loads(raw))
-        except Exception:
-            return []
-
-    async def set_channels(self, channels: list[str]) -> None:
-        await self.set_setting("channels", json.dumps(channels))
-
-    async def clear_tracks(self) -> int:
-        async with self.conn.execute("SELECT COUNT(*) FROM tracks") as cur:
-            n = (await cur.fetchone())[0]
-        await self.conn.execute("DELETE FROM tracks")
-        await self.conn.execute("DELETE FROM links")
-        await self.conn.commit()
-        return n
+_db: aiosqlite.Connection | None = None
 
 
-db = Database()
+async def init() -> None:
+    global _db
+    folder = os.path.dirname(config.DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    _db = await aiosqlite.connect(config.DB_PATH)
+    _db.row_factory = aiosqlite.Row
+    await _db.execute("PRAGMA journal_mode=WAL")
+    await _db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id   INTEGER PRIMARY KEY,
+            username  TEXT,
+            full_name TEXT,
+            joined_at INTEGER NOT NULL,
+            active    INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS tracks (
+            key        TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            artist     TEXT NOT NULL,
+            search     TEXT NOT NULL,
+            duration   INTEGER,
+            file_id    TEXT NOT NULL,
+            plays      INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tracks_plays ON tracks(plays DESC);
+        CREATE TABLE IF NOT EXISTS links (
+            url        TEXT PRIMARY KEY,
+            track_key  TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    await _db.commit()
+
+
+async def close() -> None:
+    if _db:
+        await _db.close()
+
+
+# ---------- foydalanuvchilar ----------
+async def add_user(user_id: int, username: str | None, full_name: str) -> None:
+    await _db.execute(
+        """INSERT INTO users (user_id, username, full_name, joined_at, active)
+           VALUES (?, ?, ?, ?, 1)
+           ON CONFLICT(user_id) DO UPDATE SET
+               username=excluded.username, full_name=excluded.full_name, active=1""",
+        (user_id, username, full_name, int(time.time())),
+    )
+    await _db.commit()
+
+
+async def set_inactive(user_id: int) -> None:
+    await _db.execute("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
+    await _db.commit()
+
+
+async def _scalar(sql: str, params: tuple = ()) -> int:
+    cur = await _db.execute(sql, params)
+    return (await cur.fetchone())[0]
+
+
+async def count_users() -> int:
+    return await _scalar("SELECT COUNT(*) FROM users")
+
+
+async def count_active_users() -> int:
+    return await _scalar("SELECT COUNT(*) FROM users WHERE active=1")
+
+
+async def count_new_today() -> int:
+    start = int(time.time()) // 86400 * 86400
+    return await _scalar("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (start,))
+
+
+async def get_active_user_ids() -> list[int]:
+    cur = await _db.execute("SELECT user_id FROM users WHERE active=1")
+    return [r[0] for r in await cur.fetchall()]
+
+
+# ---------- file_id kesh ----------
+async def get_track(key: str):
+    cur = await _db.execute("SELECT * FROM tracks WHERE key=?", (key,))
+    return await cur.fetchone()
+
+
+async def get_tracks(keys: list[str]) -> dict[str, aiosqlite.Row]:
+    if not keys:
+        return {}
+    marks = ",".join("?" * len(keys))
+    cur = await _db.execute(f"SELECT * FROM tracks WHERE key IN ({marks})", keys)
+    return {r["key"]: r for r in await cur.fetchall()}
+
+
+async def save_track(key: str, title: str, artist: str, duration: int | None, file_id: str) -> None:
+    await _db.execute(
+        """INSERT INTO tracks (key, title, artist, search, duration, file_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET file_id=excluded.file_id""",
+        (key, title, artist, f"{artist} {title}".lower(), duration, file_id, int(time.time())),
+    )
+    await _db.commit()
+
+
+async def delete_track(key: str) -> None:
+    await _db.execute("DELETE FROM tracks WHERE key=?", (key,))
+    await _db.commit()
+
+
+async def inc_plays(key: str) -> None:
+    await _db.execute("UPDATE tracks SET plays = plays + 1 WHERE key=?", (key,))
+    await _db.commit()
+
+
+async def search_tracks(query: str, limit: int = 10):
+    """Bazadagi (kesh) qo'shiqlar ichidan qidirish. Bir xil file_id bir marta chiqadi."""
+    words = re.findall(r"\w+", query.lower())
+    if not words:
+        return []
+    cond = " AND ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
+    params = [f"%{w.replace(chr(92), chr(92) * 2).replace('%', chr(92) + '%').replace('_', chr(92) + '_')}%" for w in words]
+    cur = await _db.execute(
+        f"SELECT *, MAX(plays) AS p FROM tracks WHERE {cond} GROUP BY file_id ORDER BY p DESC LIMIT ?",
+        (*params, limit),
+    )
+    return await cur.fetchall()
+
+
+async def top_tracks(limit: int = 30):
+    cur = await _db.execute(
+        "SELECT *, MAX(plays) AS p FROM tracks GROUP BY file_id ORDER BY p DESC, created_at DESC LIMIT ?",
+        (limit,),
+    )
+    return await cur.fetchall()
+
+
+async def count_tracks() -> int:
+    return await _scalar("SELECT COUNT(DISTINCT file_id) FROM tracks")
+
+
+async def total_plays() -> int:
+    return await _scalar("SELECT COALESCE(SUM(plays), 0) FROM tracks")
+
+
+# ---------- havola -> qo'shiq keshi ----------
+async def get_link(url: str) -> str | None:
+    cur = await _db.execute("SELECT track_key FROM links WHERE url=?", (url,))
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def set_link(url: str, track_key: str) -> None:
+    await _db.execute(
+        "INSERT INTO links (url, track_key, created_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET track_key=excluded.track_key",
+        (url, track_key, int(time.time())),
+    )
+    await _db.commit()

@@ -1,281 +1,108 @@
 import asyncio
 import logging
-from typing import Optional
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandObject, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb, Message
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandObject
+from aiogram.types import CallbackQuery, Message
 
 import config
-from handlers import ui
-from services import diag
-from services.db import db
+from services import db, utils
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 router = Router()
 router.message.filter(F.from_user.id.in_(config.ADMIN_IDS))
 router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 
-BG_TASKS: set[asyncio.Task] = set()
-PANEL_TEXT = "⚙️ <b>Admin panel</b>\n\nKerakli bo'limni tanlang:"
+_tasks: set[asyncio.Task] = set()
+
+BC_HELP = (
+    "📣 <b>Broadcast</b>\n\n"
+    "• <code>/broadcast matn</code> — matnni hammaga yuboradi\n"
+    "• Istalgan xabarga (rasm, video, matn) <b>reply</b> qilib <code>/broadcast</code> yozing"
+)
 
 
-class AdminSt(StatesGroup):
-    broadcast = State()
-    add_channel = State()
-
-
-def panel_kb() -> Kb:
-    return Kb(
-        inline_keyboard=[
-            [Btn(text="📊 Statistika", callback_data="adm:stat"), Btn(text="🩺 Diagnostika", callback_data="adm:diag")],
-            [Btn(text="📣 Xabar yuborish", callback_data="adm:bc"), Btn(text="📢 Majburiy obuna", callback_data="adm:subs")],
-            [Btn(text="🧹 Keshni tozalash", callback_data="adm:clr")],
-            [Btn(text="❌ Yopish", callback_data="adm:close")],
-        ]
-    )
-
-
-def back_kb() -> Kb:
-    return Kb(inline_keyboard=[[Btn(text="⬅️ Orqaga", callback_data="adm:home")]])
-
-
-async def _edit(cb: CallbackQuery, text: str, kb: Optional[Kb] = None) -> None:
-    try:
-        await cb.message.edit_text(text, reply_markup=kb)
-    except TelegramBadRequest:
-        pass
-
-
-# ---------------- Kirish ----------------
-@router.message(Command("admin"))
-@router.message(F.text == ui.BTN_ADMIN)
-async def open_panel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(PANEL_TEXT, reply_markup=panel_kb())
-
-
-@router.message(Command("cancel"), StateFilter("*"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Bekor qilindi.", reply_markup=panel_kb())
-
-
-@router.callback_query(F.data == "adm:home")
-async def cb_home(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _edit(cb, PANEL_TEXT, panel_kb())
-    await cb.answer()
-
-
-@router.callback_query(F.data == "adm:close")
-async def cb_close(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-    await cb.answer()
-
-
-# ---------------- Statistika ----------------
-async def _stat_text() -> str:
-    s = await db.stats()
+async def stat_text() -> str:
     return (
         "📊 <b>Statistika</b>\n\n"
-        f"👥 Jami foydalanuvchilar: <b>{s['total']}</b>\n"
-        f"🟢 So'nggi 24 soatda faol: <b>{s['active_24h']}</b>\n"
-        f"🆕 So'nggi 24 soatda yangi: <b>{s['new_24h']}</b>\n"
-        f"🚫 Botni bloklaganlar: <b>{s['blocked']}</b>\n"
-        f"💾 Keshdagi treklar: <b>{s['tracks']}</b>"
+        f"👥 Jami foydalanuvchilar: <b>{await db.count_users()}</b>\n"
+        f"✅ Faol: <b>{await db.count_active_users()}</b>\n"
+        f"🆕 Bugun qo'shilgan: <b>{await db.count_new_today()}</b>\n"
+        f"🎵 Yuklangan musiqalar (kesh): <b>{await db.count_tracks()}</b>\n"
+        f"▶️ Jami yuborilgan: <b>{await db.total_plays()}</b>"
     )
 
 
 @router.message(Command("stat"))
-async def cmd_stat(message: Message):
-    await message.answer(await _stat_text())
+async def stat(message: Message) -> None:
+    await message.answer(await stat_text())
+
+
+@router.message(F.text == utils.BTN_ADMIN)
+async def panel(message: Message) -> None:
+    await message.answer("⚙️ <b>Admin panel</b>", reply_markup=utils.admin_panel_kb())
 
 
 @router.callback_query(F.data == "adm:stat")
-async def cb_stat(cb: CallbackQuery):
-    await _edit(cb, await _stat_text(), back_kb())
+async def cb_stat(cb: CallbackQuery) -> None:
     await cb.answer()
-
-
-# ---------------- Diagnostika ----------------
-@router.message(Command("diag"))
-async def cmd_diag(message: Message):
-    wait = await message.answer("⏳ Tekshirilmoqda (1 daqiqagacha)...")
-    await wait.edit_text(await diag.run())
-
-
-@router.callback_query(F.data == "adm:diag")
-async def cb_diag(cb: CallbackQuery):
-    await cb.answer()
-    await _edit(cb, "⏳ Tekshirilmoqda (1 daqiqagacha)...")
-    await _edit(cb, await diag.run(), back_kb())
-
-
-# ---------------- Kesh ----------------
-@router.callback_query(F.data == "adm:clr")
-async def cb_clr(cb: CallbackQuery):
-    kb = Kb(inline_keyboard=[[Btn(text="✅ Ha, tozalash", callback_data="adm:clr_yes"), Btn(text="⬅️ Yo'q", callback_data="adm:home")]])
-    await _edit(cb, "🧹 Barcha keshlangan treklar o'chiriladi (bot qayta yuklab oladi). Davom etamizmi?", kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data == "adm:clr_yes")
-async def cb_clr_yes(cb: CallbackQuery):
-    n = await db.clear_tracks()
-    await _edit(cb, f"✅ {n} ta trek keshdan o'chirildi.", back_kb())
-    await cb.answer()
-
-
-# ---------------- Majburiy obuna ----------------
-async def _subs_view(cb_or_msg) -> tuple[str, Kb]:
-    chans = await db.get_channels()
-    state = "🟢 yoqilgan" if chans else "🔴 o'chirilgan (kanal yo'q)"
-    rows = [[Btn(text=f"❌ {ch}", callback_data=f"adm:rm:{i}")] for i, ch in enumerate(chans)]
-    rows.append([Btn(text="➕ Kanal qo'shish", callback_data="adm:add")])
-    rows.append([Btn(text="⬅️ Orqaga", callback_data="adm:home")])
-    text = f"📢 <b>Majburiy obuna</b>: {state}\n\nKanalni o'chirish uchun ustiga bosing.\nBot kanalda <b>admin</b> bo'lishi shart."
-    return text, Kb(inline_keyboard=rows)
-
-
-@router.callback_query(F.data == "adm:subs")
-async def cb_subs(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    text, kb = await _subs_view(cb)
-    await _edit(cb, text, kb)
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("adm:rm:"))
-async def cb_rm(cb: CallbackQuery):
-    idx = int(cb.data.split(":")[2])
-    chans = await db.get_channels()
-    if 0 <= idx < len(chans):
-        chans.pop(idx)
-        await db.set_channels(chans)
-    text, kb = await _subs_view(cb)
-    await _edit(cb, text, kb)
-    await cb.answer("O'chirildi")
-
-
-@router.callback_query(F.data == "adm:add")
-async def cb_add(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminSt.add_channel)
-    await _edit(cb, "➕ Kanal username'ini yuboring (masalan <code>@kanalim</code>).\nBekor qilish: /cancel", None)
-    await cb.answer()
-
-
-@router.message(AdminSt.add_channel, F.text)
-async def msg_add_channel(message: Message, state: FSMContext, bot: Bot):
-    raw = message.text.strip().replace("https://t.me/", "").replace("t.me/", "").lstrip("@")
-    ch = "@" + raw
-    try:
-        await bot.get_chat(ch)
-        me = await bot.me()
-        m = await bot.get_chat_member(ch, me.id)
-        if m.status not in ("administrator", "creator"):
-            await message.answer("❌ Bot bu kanalda admin emas. Avval botni admin qiling, so'ng qayta yuboring.")
-            return
-    except Exception:
-        await message.answer("❌ Kanal topilmadi yoki bot unga kira olmaydi. Username'ni tekshiring.")
-        return
-    chans = await db.get_channels()
-    if ch not in chans:
-        chans.append(ch)
-        await db.set_channels(chans)
-    await state.clear()
-    text, kb = await _subs_view(message)
-    await message.answer(f"✅ {ch} qo'shildi.\n\n{text}", reply_markup=kb)
-
-
-# ---------------- Xabar yuborish ----------------
-async def _deliver(bot: Bot, uid: int, src_chat: Optional[int], src_msg: Optional[int], text: Optional[str]) -> None:
-    if src_msg:
-        await bot.copy_message(uid, src_chat, src_msg)
-    else:
-        await bot.send_message(uid, text)
-
-
-async def run_broadcast(bot: Bot, status: Message, src_chat: Optional[int], src_msg: Optional[int], text: Optional[str]):
-    ids = await db.all_user_ids()
-    ok = fail = 0
-    for i, uid in enumerate(ids, 1):
-        try:
-            try:
-                await _deliver(bot, uid, src_chat, src_msg, text)
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
-                await _deliver(bot, uid, src_chat, src_msg, text)
-            ok += 1
-        except TelegramForbiddenError:
-            await db.mark_blocked(uid)
-            fail += 1
-        except Exception as e:
-            log.warning("Broadcast xatosi (%s): %s", uid, e)
-            fail += 1
-        if i % 50 == 0:
-            try:
-                await status.edit_text(f"📣 Yuborilmoqda... {i}/{len(ids)}")
-            except Exception:
-                pass
-        await asyncio.sleep(0.05)
-    try:
-        await status.edit_text(f"✅ Yuborish tugadi.\nYetkazildi: <b>{ok}</b>\nXato/bloklagan: <b>{fail}</b>")
-    except Exception:
-        pass
-
-
-def _spawn(coro) -> None:
-    t = asyncio.create_task(coro)
-    BG_TASKS.add(t)
-    t.add_done_callback(BG_TASKS.discard)
+    await cb.message.answer(await stat_text())
 
 
 @router.callback_query(F.data == "adm:bc")
-async def cb_bc(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminSt.broadcast)
-    await _edit(
-        cb,
-        "📣 Yubormoqchi bo'lgan xabaringizni yuboring (matn, rasm, video — istalgani).\nBekor qilish: /cancel",
-        None,
-    )
+async def cb_bc(cb: CallbackQuery) -> None:
     await cb.answer()
+    await cb.message.answer(BC_HELP)
 
 
-@router.message(AdminSt.broadcast)
-async def msg_broadcast(message: Message, state: FSMContext, bot: Bot):
-    await state.update_data(chat_id=message.chat.id, msg_id=message.message_id)
-    n = len(await db.all_user_ids())
-    await message.answer("👆 Xabar shunday ko'rinadi.")
-    await bot.copy_message(message.chat.id, message.chat.id, message.message_id)
-    kb = Kb(inline_keyboard=[[Btn(text=f"✅ Yuborish ({n} ta)", callback_data="adm:bc_go"), Btn(text="❌ Bekor", callback_data="adm:home")]])
-    await message.answer("Hammaga yuborilsinmi?", reply_markup=kb)
+async def _broadcast(bot: Bot, admin_chat: int, user_ids: list[int], text: str | None, src_id: int | None) -> None:
+    ok = blocked = failed = 0
 
+    async def send(uid: int) -> None:
+        nonlocal ok, blocked, failed
+        for _ in range(2):
+            try:
+                if src_id:
+                    await bot.copy_message(uid, admin_chat, src_id)
+                else:
+                    await bot.send_message(uid, text)
+                ok += 1
+                return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except TelegramForbiddenError:
+                blocked += 1
+                await db.set_inactive(uid)
+                return
+            except TelegramAPIError:
+                failed += 1
+                return
+        failed += 1
 
-@router.callback_query(F.data == "adm:bc_go")
-async def cb_bc_go(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    await state.clear()
-    if not data.get("msg_id"):
-        await cb.answer("Xabar topilmadi", show_alert=True)
-        return
-    await cb.answer("Boshlandi")
-    status = await cb.message.answer("📣 Yuborish boshlandi...")
-    _spawn(run_broadcast(bot, status, data["chat_id"], data["msg_id"], None))
+    for i in range(0, len(user_ids), 25):  # Telegram limiti: ~30 xabar/soniya
+        await asyncio.gather(*(send(u) for u in user_ids[i : i + 25]))
+        await asyncio.sleep(1)
+    try:
+        await bot.send_message(
+            admin_chat,
+            f"📣 <b>Broadcast tugadi</b>\n\n✅ Yuborildi: {ok}\n🚫 Bloklagan: {blocked}\n⚠️ Xato: {failed}",
+        )
+    except Exception:
+        logger.exception("Broadcast hisobotini yuborib bo'lmadi")
 
 
 @router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message, command: CommandObject, bot: Bot):
+async def broadcast(message: Message, command: CommandObject, bot: Bot) -> None:
     src = message.reply_to_message
-    if not src and not command.args:
-        await message.answer("Foydalanish: xabarga reply qilib /broadcast yozing yoki «⚙️ Admin panel → 📣 Xabar yuborish» dan foydalaning.")
+    text = (command.args or "").strip()
+    if not src and not text:
+        await message.answer(BC_HELP)
         return
-    status = await message.answer("📣 Yuborish boshlandi...")
-    _spawn(run_broadcast(bot, status, src.chat.id if src else None, src.message_id if src else None, command.args))
+    ids = await db.get_active_user_ids()
+    await message.answer(f"🚀 Broadcast boshlandi: {len(ids)} ta foydalanuvchi.")
+    task = asyncio.create_task(
+        _broadcast(bot, message.chat.id, ids, None if src else text, src.message_id if src else None)
+    )
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)

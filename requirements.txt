@@ -1,8 +1,0 @@
-aiogram>=3.7,<4
-aiohttp
-yt-dlp[default]
-shazamio
-mutagen
-aiosqlite
-Pillow
-python-dotenv

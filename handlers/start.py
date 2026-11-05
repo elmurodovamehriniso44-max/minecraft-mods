@@ -1,91 +1,77 @@
-from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+import html
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import CallbackQuery, Message
 
 import config
-from handlers import ui
-from services.subscription import get_unsubscribed
+from handlers.music import deliver_by_key
+from services import utils
 
 router = Router()
 
 WELCOME = (
     "👋 <b>Salom, {name}!</b>\n\n"
-    "Men istalgan qo'shiqni topib beraman:\n\n"
-    "✍️ <b>Nomini yozing</b> — qo'shiq yoki ijrochi nomi\n"
-    "🔗 <b>Havola yuboring</b> — Instagram, TikTok, YouTube videosidagi qo'shiqni aniqlayman\n"
-    "👥 <b>Guruhda</b> — <code>@{bot} qo'shiq nomi</code>\n\n"
-    "Pastdagi menyudan foydalaning 👇"
+    "🎵 Men qo'shiqni <b>havoladan</b> ham, <b>nomidan</b> ham topaman.\n\n"
+    "🔗 Instagram Reels, TikTok, YouTube Shorts yoki istalgan video havolasini yuboring — "
+    "videodagi qo'shiqni aniqlab, to'liq MP3 qilib beraman.\n"
+    "🔍 Yoki qo'shiq/ijrochi nomini yozing.\n\n"
+    "💡 Guruhda: <code>@{username} qo'shiq nomi</code>"
 )
-
 HELP = (
     "ℹ️ <b>Yordam</b>\n\n"
-    "1️⃣ Qo'shiq yoki ijrochi nomini yozing → natijalar ro'yxati chiqadi.\n"
-    "2️⃣ Video havolasini yuboring → qo'shiq aniqlanib, MP3 yuboriladi.\n"
-    "3️⃣ Istalgan chatda <code>@{bot} nom</code> deb yozing.\n"
-    "4️⃣ «🔥 Top musiqalar» — hozirgi mashhur treklar.\n\n"
-    "Yopiq (private) videolarni yuklab bo'lmaydi."
+    "1️⃣ Video havolasini yuboring → bot qo'shiqni aniqlaydi va to'liq MP3 yuboradi\n"
+    "2️⃣ Qo'shiq nomini yozing → natijalardan birini tanlang (◀️ ▶️ bilan sahifalang)\n"
+    "3️⃣ ⚡ belgisi — qo'shiq tayyor, bir zumda yuboriladi\n"
+    "4️⃣ 🔥 Top musiqalar — eng ko'p tinglanganlar\n\n"
+    "👥 Guruhlarda: <code>@{username} qo'shiq nomi</code>"
 )
 
 
-def _inline_row(me_username: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Shu yerda qidirish", switch_inline_query_current_chat="")],
-            [InlineKeyboardButton(text="👥 Guruhga yuborish", switch_inline_query="")],
-        ]
+async def send_welcome(message: Message, bot: Bot, user=None) -> None:
+    user = user or message.from_user
+    me = await bot.me()
+    await message.answer(
+        WELCOME.format(name=html.escape(user.full_name), username=me.username),
+        reply_markup=utils.main_menu(user.id in config.ADMIN_IDS),
     )
+
+
+@router.message(CommandStart(deep_link=True))
+async def start_deeplink(message: Message, command: CommandObject, bot: Bot) -> None:
+    arg = command.args or ""
+    if arg.startswith("dl_"):
+        await deliver_by_key(bot, message.chat.id, arg[3:])
+        return
+    await send_welcome(message, bot)
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    me = await message.bot.me()
-    admin = message.from_user.id in config.ADMIN_IDS
-    await message.answer(
-        WELCOME.format(name=message.from_user.full_name, bot=me.username), reply_markup=ui.main_kb(admin)
-    )
-
-
-@router.message(Command("help"))
-@router.message(F.text == ui.BTN_HELP)
-async def cmd_help(message: Message):
-    me = await message.bot.me()
-    await message.answer(HELP.format(bot=me.username), reply_markup=_inline_row(me.username))
-
-
-@router.message(F.text == ui.BTN_SEARCH)
-async def btn_search(message: Message):
-    await message.answer(
-        "✍️ Qo'shiq yoki ijrochi nomini yozing.\nMasalan: <code>Konsta Yor-yor</code> yoki <code>Billie Eilish</code>"
-    )
-
-
-@router.message(F.text == ui.BTN_LINK)
-async def btn_link(message: Message):
-    await message.answer(
-        "🔗 Instagram Reels, TikTok yoki YouTube Shorts havolasini yuboring — videodagi qo'shiqni topib beraman."
-    )
+async def start(message: Message, bot: Bot) -> None:
+    await send_welcome(message, bot)
 
 
 @router.callback_query(F.data == "check_sub")
-async def cb_check_sub(cb: CallbackQuery):
-    missing = await get_unsubscribed(cb.bot, cb.from_user.id)
-    if missing:
-        await cb.answer("Hali hamma kanalga obuna bo'lmadingiz ❌", show_alert=True)
-        return
-    await cb.answer("✅ Rahmat!")
-    me = await cb.bot.me()
-    if cb.message:
-        try:
-            await cb.message.delete()
-        except Exception:
-            pass
-    await cb.bot.send_message(
-        cb.from_user.id,
-        WELCOME.format(name=cb.from_user.full_name, bot=me.username),
-        reply_markup=ui.main_kb(cb.from_user.id in config.ADMIN_IDS),
-    )
+async def check_sub(cb: CallbackQuery, bot: Bot) -> None:
+    if await utils.is_subscribed(bot, cb.from_user.id, force=True):
+        await cb.answer("✅ Rahmat! Endi foydalanishingiz mumkin.")
+        if cb.message:
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            await send_welcome(cb.message, bot, user=cb.from_user)
+    else:
+        await cb.answer("❌ Siz hali obuna bo'lmadingiz.", show_alert=True)
 
 
-@router.callback_query(F.data == "noop")
-async def cb_noop(cb: CallbackQuery):
-    await cb.answer()
+@router.message(Command("help"))
+@router.message(F.text == utils.BTN_HELP)
+async def help_cmd(message: Message, bot: Bot) -> None:
+    me = await bot.me()
+    await message.answer(HELP.format(username=me.username))
+
+
+@router.message(F.text == utils.BTN_SEARCH)
+async def search_prompt(message: Message) -> None:
+    await message.answer("🔍 Qo'shiq nomini yozing yoki Instagram/TikTok/YouTube havolasini yuboring:")
