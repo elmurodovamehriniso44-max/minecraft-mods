@@ -2,9 +2,10 @@ import os
 import yt_dlp
 
 def download_audio(query_or_url: str, output_path: str = "downloads"):
-    os.makedirs(output_path, exist_ok=True
+    # Papka mavjud bo'lmasa yaratamiz
+    os.makedirs(output_path, exist_ok=True)
     
-    # yt-dlp sozlamalari (cookies fayli mavjud bo'lsa ishlatiladi)
+    # yt-dlp sozlamalari
     cookies_path = "cookies.txt"
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -18,10 +19,11 @@ def download_audio(query_or_url: str, output_path: str = "downloads"):
         'quiet': True,
     }
     
+    # Agar cookies.txt fayli mavjud bo'lsa, uni qo'shamiz
     if os.path.exists(cookies_path):
         ydl_opts['cookiefile'] = cookies_path
 
-    # Agar havola bo'lmasa, uni avtomatik SoundCloud yoki YouTube qidiruviga yo'naltiramiz
+    # Agar havola bo'lmasa, uni avtomatik ravishda SoundCloud qidiruviga yo'naltiramiz
     search_target = query_or_url if query_or_url.startswith("http") else f"scsearch:{query_or_url}"
 
     try:
