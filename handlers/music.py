@@ -1,372 +1,85 @@
-"""Spotify havola tahlili, matnli qidiruv, yuklash va inline tugmalar callback'lari."""
-import asyncio
-import logging
-import uuid
-
-from aiogram import Bot, F, Router
-from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import (
-    BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InputMediaAudio, Message,
-)
+import os
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import config
-from services import db, downloader, spotifier, tagger, utils
-from services.downloader import DownloadError
-from services.spotifier import SpotifyError, TrackInfo
+from services.downloader import search_youtube_tracks, download_audio_by_url
+from services.db import get_cached_track, save_track_cache
+from config import WORKDIR
 
-log = logging.getLogger(__name__)
-router = Router(name="music")
+router = Router()
 
-_locks: dict[str, asyncio.Lock] = {}          # bir xil trek ikki marta yuklanmasligi uchun
-_raw_queries: dict[str, str] = {}             # "to'g'ridan-to'g'ri yuklash" tugmasi uchun
-_album_busy: set[int] = set()
-
-
-# =============================================================================
-#  Asosiy mantiq: kesh -> yuklash -> teg -> yuborish -> keshga yozish
-# =============================================================================
-def _row_name(row: dict) -> str:
-    return f"{row['artist']} — {row['title']}" if row.get("artist") else row["title"]
-
-
-async def _send_cached(bot: Bot, chat_id: int, user_id: int, row: dict) -> Message | None:
-    try:
-        msg = await bot.send_audio(chat_id, row["file_id"], caption=await utils.bot_caption(bot))
-    except TelegramBadRequest as e:
-        log.warning("Keshdagi file_id yaroqsiz (id=%s): %s", row["id"], e)
-        return None
-    await db.register_download(user_id, row["id"])
-    return msg
-
-
-async def send_track(bot: Bot, chat_id: int, user_id: int, track: TrackInfo) -> Message:
-    """Trekni chatga yuboradi. Avval kesh, bo'lmasa yuklab oladi. Yuborilgan Message'ni qaytaradi."""
-    row = await db.find_cached(track.spotify_id, track.cache_key)
-    if row and (msg := await _send_cached(bot, chat_id, user_id, row)):
-        return msg
-
-    lock = _locks.setdefault(track.cache_key or track.title, asyncio.Lock())
-    async with lock:
-        row = await db.find_cached(track.spotify_id, track.cache_key)  # kutish paytida boshqasi yuklagan bo'lishi mumkin
-        if row and (msg := await _send_cached(bot, chat_id, user_id, row)):
-            return msg
-
-        query = f"{track.artist} - {track.title}" if track.artist else track.title
-        path = await downloader.download_audio(query, track.duration_s)
-        try:
-            cover = await utils.download_bytes(track.cover_url) if track.cover_url else None
-            await asyncio.to_thread(tagger.tag_mp3, path, track.title, track.artist or None, track.album, cover)
-            duration = await asyncio.to_thread(tagger.get_duration, path) or track.duration_s
-            thumb = BufferedInputFile(cover, "cover.jpg") if cover and len(cover) < 200 * 1024 else None
-
-            msg = await bot.send_audio(
-                chat_id,
-                FSInputFile(path, filename=f"{utils.sanitize_filename(track.display)}.mp3"),
-                title=track.title,
-                performer=track.artist or None,
-                duration=duration,
-                thumbnail=thumb,
-                caption=await utils.bot_caption(bot),
-            )
-            track_id = await db.save_track(
-                cache_key=track.cache_key or utils.normalize_key(track.title),
-                spotify_id=track.spotify_id, artist=track.artist, title=track.title,
-                album=track.album, cover_url=track.cover_url, duration=duration,
-                file_id=msg.audio.file_id,
-            )
-            await db.register_download(user_id, track_id)
-            return msg
-        finally:
-            utils.safe_unlink(path)
-
-
-async def _fail(bot: Bot, chat_id: int, status: Message | None, text: str) -> None:
-    try:
-        if status:
-            await status.edit_text(text)
-        else:
-            await bot.send_message(chat_id, text)
-    except TelegramAPIError:
-        pass
-
-
-async def deliver(bot: Bot, chat_id: int, user_id: int, track: TrackInfo,
-                  status: Message | None = None) -> Message | None:
-    """send_track + xatolarni foydalanuvchiga tushunarli qilib ko'rsatish."""
-    try:
-        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
-        msg = await send_track(bot, chat_id, user_id, track)
-    except DownloadError as e:
-        log.error("Yuklab bo'lmadi '%s': %s", track.display, e)
-        await _fail(bot, chat_id, status, f"❌ <b>{utils.truncate(track.display, 80)}</b> yuklab bo'lmadi.\n"
-                                           "Keyinroq yoki boshqa nom bilan urinib ko'ring.")
-        return None
-    except TelegramForbiddenError:
-        return None
-    except Exception:
-        log.exception("Kutilmagan xato: %s", track.display)
-        await _fail(bot, chat_id, status, "⚠️ Kutilmagan xatolik yuz berdi. Keyinroq urinib ko'ring.")
-        return None
-    if status:
-        try:
-            await status.delete()
-        except TelegramAPIError:
-            pass
-    return msg
-
-
-# =============================================================================
-#  Klaviaturalar
-# =============================================================================
-def _results_kb(items: list[tuple[str, str]], raw_text: str | None = None) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for text, data in items:
-        kb.button(text=utils.truncate(text, 60), callback_data=data)
-    if raw_text:
-        rid = uuid.uuid4().hex[:10]
-        _raw_queries[rid] = raw_text
-        while len(_raw_queries) > 500:
-            _raw_queries.pop(next(iter(_raw_queries)))
-        kb.button(text="🌐 Shu nomni to'g'ridan-to'g'ri yuklash", callback_data=f"raw:{rid}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-# =============================================================================
-#  Top musiqalar
-# =============================================================================
-@router.message(F.text == config.BTN_TOP)
-async def top_tracks(message: Message):
-    rows = await db.top_tracks(10)
-    if not rows:
-        await message.answer("Hozircha top musiqalar yo'q. Birinchi bo'lib qo'shiq yuklab oling! 🎧")
-        return
-    items = [(f"🔥 {_row_name(r)}", f"dc:{r['id']}") for r in rows]
-    await message.answer("🔥 <b>Top musiqalar</b>", reply_markup=_results_kb(items))
-
-
-# =============================================================================
-#  Matn / havola qabul qilish (eng oxirgi umumiy handler)
-# =============================================================================
-@router.message(F.text & ~F.text.startswith("/"))
-async def on_text(message: Message, bot: Bot):
+@router.message(F.text)
+async def handle_music_search(message: Message):
     text = message.text.strip()
-    parsed = spotifier.parse_url(text)
-
-    if parsed:
-        kind, sid = parsed
-        if kind == "track":
-            await _handle_track_link(message, bot, sid)
-        else:
-            await _handle_album_link(message, sid)
+    
+    # 1. Keshdan tekshirish
+    cached = get_cached_track(text)
+    if cached:
+        file_id, title, performer = cached
+        await message.answer_audio(audio=file_id, caption=f"🎵 {performer} - {title}\n🤖 @{message.bot.username}")
         return
 
-    if "open.spotify.com" in text or "spotify.link" in text:
-        await message.answer("⚠️ Hozircha faqat Spotify <b>trek</b> va <b>albom</b> havolalari qo'llab-quvvatlanadi.")
+    status_msg = await message.reply("🔍 Qo'shiqlar va variantlar qidirilmoqda...")
+
+    # 2. 24 tagacha variantni qidirish
+    results = search_youtube_tracks(text, limit=24)
+    
+    if not results:
+        await status_msg.edit_text("❌ Hech narsa topilmadi. Qayta yozib ko'ring.")
         return
 
-    await _handle_search(message, text)
+    # 3. Natijalarni inline tugmalarga joylash
+    builder = InlineKeyboardBuilder()
+    for item in results:
+        title = item.get('title', 'Nomaʼlum trek')
+        video_id = item.get('id')
+        
+        # Tugma matni juda uzun bo'lib ketmasligi uchun qisqartiramiz
+        display_title = title[:45] + "..." if len(title) > 45 else title
+        builder.row(InlineKeyboardButton(text=f"🎵 {display_title}", callback_data=f"dl_{video_id}"))
 
+    builder.adjust(1) # Har bir qatorda 1 tadan tugma
 
-async def _handle_track_link(message: Message, bot: Bot, sid: str):
-    status = await message.answer("🔎 Havola tahlil qilinmoqda…")
-    row = await db.get_track_by_spotify_id(sid)
-    if row:  # Spotify'ga murojaat qilmasdan, kesh orqali darhol
-        track = TrackInfo(sid, row["artist"], row["title"], row["album"], row["cover_url"],
-                          (row["duration"] or 0) * 1000 or None)
-    else:
-        try:
-            track = await spotifier.get_track(sid)
-        except SpotifyError:
-            await status.edit_text("❌ Spotify'dan ma'lumot olib bo'lmadi. Havolani tekshiring yoki qo'shiq nomini yozing.")
-            return
-    await status.edit_text(f"⏳ <b>{utils.truncate(track.display, 80)}</b> tayyorlanmoqda…")
-    await deliver(bot, message.chat.id, message.from_user.id, track, status)
-
-
-async def _handle_album_link(message: Message, sid: str):
-    try:
-        album = await spotifier.get_album(sid)
-    except SpotifyError:
-        await message.answer("❌ Albom ma'lumotini olib bo'lmadi.")
-        return
-    if not album.tracks:
-        await message.answer("Albomda treklar topilmadi.")
-        return
-    items = [(f"{i}. {t.title}", f"dl:{t.spotify_id}") for i, t in enumerate(album.tracks[:20], 1)]
-    kb = InlineKeyboardBuilder()
-    for text, data in items:
-        kb.button(text=utils.truncate(text, 60), callback_data=data)
-    n = min(len(album.tracks), config.ALBUM_MAX_TRACKS)
-    kb.button(text=f"📥 Birinchi {n} ta trekni yuklash", callback_data=f"alb:{sid}")
-    kb.adjust(1)
-    caption = f"💿 <b>{album.name}</b>\n👤 {album.artist}\n🎵 Treklar: {len(album.tracks)}"
-    if album.cover_url:
-        try:
-            await message.answer_photo(album.cover_url, caption=caption, reply_markup=kb.as_markup())
-            return
-        except TelegramAPIError:
-            pass
-    await message.answer(caption, reply_markup=kb.as_markup())
-
-
-async def _handle_search(message: Message, text: str):
-    status = await message.answer("🔎 Qidirilmoqda…")
-    cached = await db.search_tracks(text, 5)
-    try:
-        found = await spotifier.search(text, 8)
-    except SpotifyError:
-        found = []
-
-    items: list[tuple[str, str]] = []
-    seen_ids = {r["spotify_id"] for r in cached if r["spotify_id"]}
-    seen_keys = {r["cache_key"] for r in cached}
-    for r in cached:
-        items.append((f"⚡ {_row_name(r)}", f"dc:{r['id']}"))
-    for t in found:
-        if t.spotify_id in seen_ids or t.cache_key in seen_keys:
-            continue
-        dur = utils.fmt_duration(t.duration_s)
-        items.append((f"🎵 {t.display}" + (f" ({dur})" if dur else ""), f"dl:{t.spotify_id}"))
-
-    if not items:
-        # Spotify'da topilmadi yoki ishlamayapti -> to'g'ridan-to'g'ri qidirib yuklaymiz
-        await status.edit_text(f"⏳ <b>{utils.truncate(text, 80)}</b> to'g'ridan-to'g'ri qidirilmoqda…")
-        await deliver(message.bot, message.chat.id, message.from_user.id,
-                      TrackInfo(None, "", text), status)
-        return
-
-    await status.edit_text(
-        f"🔎 <b>«{utils.truncate(text, 60)}»</b> bo'yicha natijalar:\n<i>⚡ — tayyor (darhol yuboriladi)</i>",
-        reply_markup=_results_kb(items, raw_text=text),
+    await status_msg.edit_text(
+        f"🔎 **\"{text}\"** bo'yicha topilgan variantlar:\nKerakli qo'shiqni tanlang:",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
     )
 
+# 4. Foydalanuvchi tugmani bosganda ishlaydigan handler
+@router.callback_query(F.data.startswith("dl_"))
+async def process_track_download(callback: CallbackQuery):
+    video_id = callback.data.split("_")[1]
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    await callback.message.edit_text("📥 Tanlangan qo'shiq yuklab olinmoqda...")
+    
+    mp3_path, title, performer = download_audio_by_url(url, WORKDIR)
+    
+    if not mp3_path or not os.path.exists(mp3_path):
+        await callback.message.edit_text("❌ Yuklab olishda xatolik yuz berdi. Qayta urinib ko'ring.")
+        return
 
-# =============================================================================
-#  Callback'lar
-# =============================================================================
-async def _edit_inline_audio(bot: Bot, inline_id: str, file_id: str) -> None:
-    """Inline xabarni audio bilan almashtiradi (faqat file_id orqali mumkin)."""
+    await callback.message.edit_text("📤 Fayl Telegramga yuborilmoqda...")
+    
     try:
-        await bot.edit_message_media(
-            media=InputMediaAudio(media=file_id, caption=await utils.bot_caption(bot)),
-            inline_message_id=inline_id,
+        audio_file = FSInputFile(mp3_path)
+        sent_msg = await callback.message.answer_audio(
+            audio=audio_file, 
+            caption=f"🎶 {title}\n🤖 @{callback.bot.username}"
         )
-    except TelegramAPIError as e:
-        log.warning("Inline xabarni audioga almashtirib bo'lmadi: %s", e)
-        try:
-            await bot.edit_message_text("✅ Audio tayyor. Uni bot bilan shaxsiy chatda ko'rishingiz mumkin.",
-                                        inline_message_id=inline_id)
-        except TelegramAPIError:
-            pass
-
-
-async def _inline_flow(call: CallbackQuery, bot: Bot, *, row: dict | None, spotify_id: str | None) -> None:
-    user_id = call.from_user.id
-    inline_id = call.inline_message_id
-    await call.answer("⏳ Tayyorlanmoqda, biroz kuting…")
-
-    file_id = None
-    if row:
-        file_id = row["file_id"]
-        await db.register_download(user_id, row["id"])
-    else:
-        try:
-            track = await spotifier.get_track(spotify_id)
-            # Inline'da fayl yuklab bo'lmaydi: avval foydalanuvchi PM'iga yuklab, file_id olamiz
-            msg = await send_track(bot, user_id, user_id, track)
-        except TelegramForbiddenError:
-            me = await bot.me()
-            await bot.edit_message_text(f"⚠️ Avval @{me.username} botiga o'tib /start bosing, so'ng qayta urinib ko'ring.",
-                                        inline_message_id=inline_id)
-            return
-        except (DownloadError, SpotifyError):
-            await bot.edit_message_text("❌ Yuklab bo'lmadi. Keyinroq urinib ko'ring.", inline_message_id=inline_id)
-            return
-        file_id = msg.audio.file_id
-        try:
-            await msg.delete()  # vaqtinchalik xabar
-        except TelegramAPIError:
-            pass
-    await _edit_inline_audio(bot, inline_id, file_id)
-
-
-@router.callback_query(F.data.startswith("dl:"))
-async def cb_download(call: CallbackQuery, bot: Bot):
-    sid = call.data[3:]
-    if call.inline_message_id:
-        await _inline_flow(call, bot, row=await db.get_track_by_spotify_id(sid), spotify_id=sid)
-        return
-
-    await call.answer("⏳ Yuklanmoqda…")
-    chat_id = call.message.chat.id if call.message else call.from_user.id
-    row = await db.get_track_by_spotify_id(sid)
-    if row:
-        if not await _send_cached(bot, chat_id, call.from_user.id, row):
-            row = None
-        else:
-            return
-    try:
-        track = await spotifier.get_track(sid)
-    except SpotifyError:
-        await bot.send_message(chat_id, "❌ Spotify'dan ma'lumot olib bo'lmadi.")
-        return
-    status = await bot.send_message(chat_id, f"⏳ <b>{utils.truncate(track.display, 80)}</b> tayyorlanmoqda…")
-    await deliver(bot, chat_id, call.from_user.id, track, status)
-
-
-@router.callback_query(F.data.startswith("dc:"))
-async def cb_cached(call: CallbackQuery, bot: Bot):
-    row = await db.get_track_by_id(int(call.data[3:]))
-    if not row:
-        await call.answer("Trek topilmadi.", show_alert=True)
-        return
-    if call.inline_message_id:
-        await _inline_flow(call, bot, row=row, spotify_id=row["spotify_id"])
-        return
-    await call.answer("⚡ Yuborilmoqda…")
-    chat_id = call.message.chat.id if call.message else call.from_user.id
-    if not await _send_cached(bot, chat_id, call.from_user.id, row):
-        await bot.send_message(chat_id, "⚠️ Bu trek keshdan o'chib ketgan, nomini qayta yozib qidiring.")
-
-
-@router.callback_query(F.data.startswith("raw:"))
-async def cb_raw(call: CallbackQuery, bot: Bot):
-    query = _raw_queries.get(call.data[4:])
-    if not query:
-        await call.answer("Tugma eskirgan, qayta qidiring.", show_alert=True)
-        return
-    await call.answer("⏳ Qidirilmoqda…")
-    chat_id = call.message.chat.id if call.message else call.from_user.id
-    status = await bot.send_message(chat_id, f"⏳ <b>{utils.truncate(query, 80)}</b> qidirilmoqda…")
-    await deliver(bot, chat_id, call.from_user.id, TrackInfo(None, "", query), status)
-
-
-@router.callback_query(F.data.startswith("alb:"))
-async def cb_album(call: CallbackQuery, bot: Bot):
-    uid = call.from_user.id
-    if uid in _album_busy:
-        await call.answer("Oldingi albom hali yuklanmoqda…", show_alert=True)
-        return
-    try:
-        album = await spotifier.get_album(call.data[4:])
-    except SpotifyError:
-        await call.answer("Albomni olib bo'lmadi.", show_alert=True)
-        return
-    await call.answer("📥 Albom yuklanmoqda…")
-    chat_id = call.message.chat.id if call.message else uid
-    tracks = album.tracks[: config.ALBUM_MAX_TRACKS]
-    _album_busy.add(uid)
-    try:
-        status = await bot.send_message(chat_id, f"📥 Albom yuklanmoqda: 0/{len(tracks)}")
-        for i, t in enumerate(tracks, 1):
-            await deliver(bot, chat_id, uid, t)
-            try:
-                await status.edit_text(f"📥 Albom yuklanmoqda: {i}/{len(tracks)}")
-            except TelegramAPIError:
-                pass
-        await status.edit_text(f"✅ <b>{album.name}</b> — tayyor!")
+        
+        # File_ID ni keshga saqlaymiz
+        if sent_msg.audio:
+            save_track_cache(video_id, sent_msg.audio.file_id, title, performer)
+            
+        await callback.message.delete()
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Yuborishda xatolik: {e}")
     finally:
-        _album_busy.discard(uid)
+        if os.path.exists(mp3_path):
+            try:
+                os.remove(mp3_path)
+            except:
+                pass
