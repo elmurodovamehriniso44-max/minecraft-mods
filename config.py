@@ -54,7 +54,8 @@ COOKIES_CANDIDATES = [p for p in (
 ) if p]
 COOKIES_RUNTIME = DATA_DIR / "cookies_runtime.txt"  # yt-dlp yozishi mumkin, shuning uchun nusxa ishlatiladi
 
-PLAYER_CLIENTS = [c.strip() for c in _env("YT_PLAYER_CLIENTS", "android,web,ios").split(",") if c.strip()]
+PLAYER_CLIENTS = [c.strip() for c in _env("YT_PLAYER_CLIENTS", "android_vr,web_embedded,android,web,ios").split(",") if c.strip()]
+PROXY_URL = _env("PROXY_URL")   # masalan: http://user:pass@host:port (YouTube bloklasa — rezident proksi)
 AUDIO_QUALITY = _env("AUDIO_QUALITY", "128")        # MP3 bitrate (kbps): past = tezroq va yengilroq
 MAX_FILE_MB = int(_env("MAX_FILE_MB", "49"))        # Bot API limiti: 50 MB
 MAX_DURATION = int(_env("MAX_DURATION", "1200"))    # soniya (20 daqiqadan uzun videolar o'tkazib yuboriladi)

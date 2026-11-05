@@ -121,6 +121,8 @@ def _score(entry: dict, query_l: str, target: int | None) -> float:
 def _search_entries(prefix: str, query: str, cookies: str | None, n: int) -> list[dict]:
     """Qidiradi (yuklamasdan) va yaroqli natijalarni qaytaradi."""
     opts = {**_base_opts(cookies), "extract_flat": True, "skip_download": True}
+    if config.PROXY_URL and prefix == "ytsearch":
+        opts["proxy"] = config.PROXY_URL
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
     source = "youtube" if prefix == "ytsearch" else "soundcloud"
@@ -194,6 +196,8 @@ def _fetch(url: str, client: str | None, cookies: str | None, target: int | None
     }
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    if config.PROXY_URL and _is_youtube(url):
+        opts["proxy"] = config.PROXY_URL
     t0 = time.monotonic()
     try:
         with YoutubeDL(opts) as ydl:
@@ -273,7 +277,11 @@ def _download_sync(query: str, duration_hint: int | None, url: str | None) -> Pa
         if path:
             return path
 
-    raise DownloadError(" | ".join(errors[-4:]) or "Hech narsa topilmadi")
+    joined = " | ".join(errors[-4:]) or "Hech narsa topilmadi"
+    if "not a bot" in joined or "Sign in to confirm" in joined:
+        log.error("YouTube bu server IP'sini bloklayapti. Yechim: PROXY_URL (rezident proksi) "
+                  "va/yoki yangi cookies.txt. Qarang: README / .env.example")
+    raise DownloadError(joined)
 
 
 def _search_candidates_sync(query: str, n: int) -> list[dict]:

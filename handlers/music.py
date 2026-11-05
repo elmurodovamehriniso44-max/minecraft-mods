@@ -13,7 +13,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
-from services import db, downloader, spotifier, tagger, utils
+from services import db, deezer, downloader, spotifier, tagger, utils
 from services.downloader import DownloadError
 from services.spotifier import SpotifyError, TrackInfo
 
@@ -132,6 +132,18 @@ async def deliver(bot: Bot, chat_id: int, user_id: int, track: TrackInfo,
     return msg
 
 
+def new_session(*, tracks: dict[int, TrackInfo] | None = None, yt: dict[int, dict] | None = None) -> str:
+    """Qidiruv natijalarini (callback uchun) vaqtincha xotirada saqlaydi."""
+    now = time.time()
+    for k in [k for k, v in _yt_results.items() if now - v["ts"] > 3600]:
+        _yt_results.pop(k, None)
+    while len(_yt_results) > 300:
+        _yt_results.pop(next(iter(_yt_results)))
+    sid = uuid.uuid4().hex[:8]
+    _yt_results[sid] = {"ts": now, "tracks": tracks or {}, "items": yt or {}}
+    return sid
+
+
 # =============================================================================
 #  Natijalar klaviaturasi
 # =============================================================================
@@ -226,9 +238,9 @@ async def _handle_album_link(message: Message, sid: str):
 async def _handle_search(message: Message, text: str):
     status = await message.answer("🔎 Qidirilmoqda…")
 
-    cached = await db.search_tracks(text, 5)           # bazadagi tayyor treklar
+    cached = await db.search_tracks(text, 5)           # 1) bazadagi tayyor treklar
     try:
-        found = await spotifier.search(text, TOTAL_RESULTS)
+        found = await spotifier.search(text, TOTAL_RESULTS)   # 2) Spotify
     except SpotifyError:
         found = []
 
@@ -245,13 +257,29 @@ async def _handle_search(message: Message, text: str):
             break
         if t.spotify_id in seen_ids or t.cache_key in seen_keys:
             continue
+        seen_ids.add(t.spotify_id)
+        seen_keys.add(t.cache_key)
         dur = utils.fmt_duration(t.duration_s)
         items.append({"label": f"🎵 {t.display}" + (f" ({dur})" if dur else ""), "data": f"dl:{t.spotify_id}"})
 
-    # Spotify yetarli natija bermasa (yoki ishlamasa) — YouTube/SoundCloud variantlari bilan to'ldiramiz
-    sid = uuid.uuid4().hex[:8]
-    yt_map: dict[int, dict] = {}
+    # 3) Spotify yetmasa/ishlamasa — Deezer (haqiqiy qo'shiqlar ro'yxati, muqova bilan)
+    track_map: dict[int, TrackInfo] = {}
+    sid = None
     if len(items) < TOTAL_RESULTS:
+        for t in await deezer.search(text, TOTAL_RESULTS + 5):
+            if len(items) >= TOTAL_RESULTS:
+                break
+            if t.cache_key in seen_keys:
+                continue
+            seen_keys.add(t.cache_key)
+            idx = len(track_map)
+            track_map[idx] = t
+            dur = utils.fmt_duration(t.duration_s)
+            items.append({"label": f"🎵 {t.display}" + (f" ({dur})" if dur else ""), "data": f"tk:@SID@:{idx}"})
+
+    # 4) Oxirgi chora — YouTube/SoundCloud natijalari (faqat deyarli hech narsa topilmasa)
+    yt_map: dict[int, dict] = {}
+    if len(items) < 3:
         try:
             cands = await downloader.search_candidates(text, TOTAL_RESULTS - len(items) + 6)
         except Exception as e:
@@ -270,17 +298,14 @@ async def _handle_search(message: Message, text: str):
             dur = utils.fmt_duration(c["duration"])
             icon = "▶️" if c["source"] == "youtube" else "☁️"
             items.append({"label": f"{icon} {c['title']}" + (f" ({dur})" if dur else ""),
-                          "data": f"yt:{sid}:{idx}"})
-        if yt_map:
-            now = time.time()
-            for k in [k for k, v in _yt_results.items() if now - v["ts"] > 3600]:
-                _yt_results.pop(k, None)
-            while len(_yt_results) > 300:
-                _yt_results.pop(next(iter(_yt_results)))
-            _yt_results[sid] = {"ts": now, "items": yt_map}
+                          "data": f"yt:@SID@:{idx}"})
+
+    if track_map or yt_map:
+        sid = new_session(tracks=track_map, yt=yt_map)
+        for it in items:
+            it["data"] = it["data"].replace("@SID@", sid)
 
     if not items:
-        # Hech qayerdan variant topilmadi -> to'g'ridan-to'g'ri qidirib yuklaymiz
         await status.edit_text(f"⏳ <b>{utils.truncate(text, 80)}</b> to'g'ridan-to'g'ri qidirilmoqda…")
         await deliver(message.bot, message.chat.id, message.from_user.id, TrackInfo(None, "", text), status)
         return
@@ -310,6 +335,24 @@ async def cb_youtube(call: CallbackQuery, bot: Bot):
     await deliver(bot, chat_id, call.from_user.id, track, status, source_url=cand["url"])
 
 
+@router.callback_query(F.data.startswith("tk:"))
+async def cb_track(call: CallbackQuery, bot: Bot):
+    """Deezer ro'yxatidan tanlangan qo'shiq: Artist - Title bo'yicha yuklanadi."""
+    _, sid, idx = call.data.split(":")
+    track = (_yt_results.get(sid) or {}).get("tracks", {}).get(int(idx))
+    if not track:
+        await call.answer("Natijalar eskirgan, qayta qidiring.", show_alert=True)
+        return
+    if call.inline_message_id:
+        row = await db.find_cached(None, track.cache_key)
+        await _inline_flow(call, bot, row=row, spotify_id=None, track=track)
+        return
+    await call.answer("⏳ Yuklanmoqda…")
+    chat_id = call.message.chat.id if call.message else call.from_user.id
+    status = await bot.send_message(chat_id, f"⏳ <b>{utils.truncate(track.display, 80)}</b> tayyorlanmoqda…")
+    await deliver(bot, chat_id, call.from_user.id, track, status)
+
+
 async def _edit_inline_audio(bot: Bot, inline_id: str, file_id: str) -> None:
     """Inline xabarni audio bilan almashtiradi (faqat file_id orqali mumkin)."""
     try:
@@ -326,7 +369,8 @@ async def _edit_inline_audio(bot: Bot, inline_id: str, file_id: str) -> None:
             pass
 
 
-async def _inline_flow(call: CallbackQuery, bot: Bot, *, row: dict | None, spotify_id: str | None) -> None:
+async def _inline_flow(call: CallbackQuery, bot: Bot, *, row: dict | None, spotify_id: str | None,
+                       track: TrackInfo | None = None) -> None:
     user_id = call.from_user.id
     inline_id = call.inline_message_id
     await call.answer("⏳ Tayyorlanmoqda, biroz kuting…")
@@ -336,7 +380,7 @@ async def _inline_flow(call: CallbackQuery, bot: Bot, *, row: dict | None, spoti
         await db.register_download(user_id, row["id"])
     else:
         try:
-            track = await spotifier.get_track(spotify_id)
+            track = track or await spotifier.get_track(spotify_id)
             # Inline'da fayl yuklab bo'lmaydi: avval foydalanuvchi PM'iga yuklab, file_id olamiz
             msg = await send_track(bot, user_id, user_id, track)
         except TelegramForbiddenError:

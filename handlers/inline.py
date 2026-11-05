@@ -8,8 +8,10 @@ from aiogram.types import (
     InlineQueryResultCachedAudio, InputTextMessageContent,
 )
 
-from services import db, spotifier, utils
+from services import db, deezer, spotifier, utils
 from services.spotifier import SpotifyError
+
+from . import music as music_handlers
 
 log = logging.getLogger(__name__)
 router = Router(name="inline")
@@ -67,8 +69,19 @@ async def on_inline(query: InlineQuery, bot: Bot):
     for t in found:
         if t.spotify_id in seen_ids or t.cache_key in seen_keys:
             continue
+        seen_keys.add(t.cache_key)
         desc = " • ".join(x for x in (t.album, utils.fmt_duration(t.duration_s)) if x)
         results.append(_article(f"s{t.spotify_id}", t.display, desc, f"dl:{t.spotify_id}", t.cover_url))
+
+    # Spotify yetmasa/ishlamasa — Deezer ro'yxati
+    if len(results) < 10:
+        extra = [t for t in await deezer.search(text, 15) if t.cache_key not in seen_keys]
+        extra = extra[: 10 - len(results)]
+        if extra:
+            sid = music_handlers.new_session(tracks=dict(enumerate(extra)))
+            for i, t in enumerate(extra):
+                desc = " • ".join(x for x in (t.album, utils.fmt_duration(t.duration_s)) if x)
+                results.append(_article(f"d{sid}{i}", t.display, desc, f"tk:{sid}:{i}", t.cover_url))
 
     if not results:
         results = [InlineQueryResultArticle(
