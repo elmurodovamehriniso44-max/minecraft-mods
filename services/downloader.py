@@ -22,12 +22,11 @@ def _find_js_runtimes() -> dict:
 
 JS_RUNTIMES = _find_js_runtimes()
 
-# YouTube blokirovkalarini chetlab o'tish uchun kengaytirilgan player_client profillari
+# YouTube bloklasa, boshqa "player client" lar bilan qayta urinamiz
 PROFILES: list[dict] = [
     {},
-    {"extractor_args": {"youtube": {"player_client": ["android", "web"]}}},
     {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["mweb", "ios"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}},
 ]
 FATAL = ("private video", "video unavailable", "has been removed", "this video is not available")
 
@@ -37,8 +36,8 @@ def _base_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 5,
+        "socket_timeout": 20,
+        "retries": 3,
     }
     if JS_RUNTIMES:
         opts["js_runtimes"] = JS_RUNTIMES
@@ -59,7 +58,7 @@ def _ydl(opts: dict) -> yt_dlp.YoutubeDL:
 
 def _download_sync(target: str, workdir: Path, bitrate: str, max_duration: int, profile: dict) -> tuple[Path, dict]:
     if not shutil.which("ffmpeg"):
-        raise DownloadError("ffmpeg topilmadi. Uni o'rnating va botni qayta ishga tushiring.")
+        raise DownloadError("ffmpeg topilmadi. Uni o'rnating (Windows: winget install ffmpeg) va botni qayta ishga tushiring.")
     opts = _base_opts() | profile | {
         "format": "bestaudio/best",
         "outtmpl": str(workdir / "audio.%(ext)s"),
