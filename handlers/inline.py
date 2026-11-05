@@ -1,84 +1,85 @@
-import html
+"""Inline rejim: @bot_username qo'shiq nomi"""
 import logging
 
 from aiogram import Bot, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InlineQuery,
-    InlineQueryResultArticle,
-    InlineQueryResultCachedAudio,
-    InputTextMessageContent,
+    InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery, InlineQueryResultArticle,
+    InlineQueryResultCachedAudio, InputTextMessageContent,
 )
 
-from services import db, downloader, utils
+from services import db, spotifier, utils
+from services.spotifier import SpotifyError
 
-logger = logging.getLogger(__name__)
-router = Router()
+log = logging.getLogger(__name__)
+router = Router(name="inline")
 
 
-def _article(rid: str, title: str, text: str, url: str | None = None) -> InlineQueryResultArticle:
-    markup = None
-    if url:
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="▶️ Tinglash", url=url)]])
+def _article(rid: str, title: str, desc: str, callback_data: str, thumb: str | None = None):
+    safe = utils.truncate(title, 100)
     return InlineQueryResultArticle(
         id=rid[:64],
-        title=title,
-        input_message_content=InputTextMessageContent(message_text=text, parse_mode="HTML"),
-        reply_markup=markup,
+        title=safe,
+        description=desc,
+        thumbnail_url=thumb,
+        input_message_content=InputTextMessageContent(
+            message_text=f"🎵 <b>{safe}</b>\n\n<i>Audio yuklash uchun tugmani bosing 👇</i>",
+            parse_mode="HTML",
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬇️ Yuklab olish", callback_data=callback_data)
+        ]]),
     )
 
 
 @router.inline_query()
-async def on_inline(q: InlineQuery, bot: Bot) -> None:
+async def on_inline(query: InlineQuery, bot: Bot):
+    text = (query.query or "").strip()
+
+    # Bo'sh so'rov: eng ko'p yuklangan tayyor musiqalar (darhol yuboriladi)
+    if len(text) < 2:
+        rows = await db.top_tracks(20)
+        if rows:
+            caption = await utils.bot_caption(bot)
+            results = [InlineQueryResultCachedAudio(id=f"c{r['id']}", audio_file_id=r["file_id"], caption=caption)
+                       for r in rows]
+        else:
+            results = [InlineQueryResultArticle(
+                id="hint", title="Qo'shiq nomini yozing…", description="Masalan: Imagine Dragons Believer",
+                input_message_content=InputTextMessageContent(message_text="🎧 Qo'shiq nomini yozing."),
+            )]
+        await _safe_answer(query, results, cache_time=30)
+        return
+
+    cached = await db.search_tracks(text, 8)
     try:
-        query = (q.query or "").strip()
-        if len(query) < 2:
-            await q.answer([], cache_time=5, is_personal=True)
-            return
+        found = await spotifier.search(text, 8)
+    except SpotifyError:
+        found = []
 
-        me = await bot.me()
-        if not await utils.is_subscribed(bot, q.from_user.id):
-            await q.answer(
-                [_article("sub", "📢 Avval kanalga obuna bo'ling", f"Botdan foydalanish uchun @{me.username} ga o'tib kanalga obuna bo'ling.")],
-                cache_time=5,
-                is_personal=True,
-            )
-            return
+    results = []
+    seen_ids = {r["spotify_id"] for r in cached if r["spotify_id"]}
+    seen_keys = {r["cache_key"] for r in cached}
+    for r in cached:
+        name = f"{r['artist']} — {r['title']}" if r["artist"] else r["title"]
+        cb = f"dl:{r['spotify_id']}" if r["spotify_id"] else f"dc:{r['id']}"
+        results.append(_article(f"c{r['id']}", f"⚡ {name}", "Tayyor — tezda yuboriladi", cb, r["cover_url"]))
+    for t in found:
+        if t.spotify_id in seen_ids or t.cache_key in seen_keys:
+            continue
+        desc = " • ".join(x for x in (t.album, utils.fmt_duration(t.duration_s)) if x)
+        results.append(_article(f"s{t.spotify_id}", t.display, desc, f"dl:{t.spotify_id}", t.cover_url))
 
-        cached = await db.search_tracks(query, limit=8)
-        try:
-            yt = await downloader.search_youtube(query, limit=10)
-        except Exception as e:
-            logger.warning("Inline qidiruv (YouTube) xatosi: %s", str(e)[:200])
-            yt = []
-        have = await db.get_tracks([r.video_id for r in yt])
+    if not results:
+        results = [InlineQueryResultArticle(
+            id="none", title="Hech narsa topilmadi", description="Boshqa nom bilan urinib ko'ring",
+            input_message_content=InputTextMessageContent(message_text="❌ Hech narsa topilmadi."),
+        )]
+    await _safe_answer(query, results, cache_time=20)
 
-        answers, seen = [], set()
-        for r in cached:  # bazada bor -> guruhning o'zida darhol audio yuboriladi
-            seen.add(r["file_id"])
-            answers.append(InlineQueryResultCachedAudio(id=r["key"][:64], audio_file_id=r["file_id"]))
-        for r in yt:  # yo'q -> botga deep-link orqali o'tadi
-            row = have.get(r.video_id)
-            if row and row["file_id"] in seen:
-                continue
-            if row:
-                seen.add(row["file_id"])
-                answers.append(InlineQueryResultCachedAudio(id=r.video_id, audio_file_id=row["file_id"]))
-                continue
-            label = f"{r.artist} - {r.title}"
-            answers.append(
-                _article(
-                    r.video_id,
-                    f"🎵 {label}",
-                    f"🎵 <b>{html.escape(label)}</b>\n\nTinglash uchun tugmani bosing 👇",
-                    f"https://t.me/{me.username}?start=dl_{r.video_id}",
-                )
-            )
-        await q.answer(answers[:50], cache_time=60)
-    except Exception:
-        logger.exception("Inline qidiruvda xatolik")
-        try:
-            await q.answer([], cache_time=5)
-        except Exception:
-            pass
+
+async def _safe_answer(query: InlineQuery, results: list, cache_time: int) -> None:
+    try:
+        await query.answer(results[:50], cache_time=cache_time, is_personal=False)
+    except TelegramAPIError as e:
+        log.warning("Inline javob xatosi: %s", e)

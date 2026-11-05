@@ -1,172 +1,156 @@
-import os
-import re
-import time
-
+"""SQLite: foydalanuvchilar, statistika va file_id kesh."""
 import aiosqlite
 
 import config
+from services.utils import normalize_key
 
 _db: aiosqlite.Connection | None = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT,
+    full_name   TEXT,
+    joined_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+    last_active TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cache_key   TEXT UNIQUE NOT NULL,
+    spotify_id  TEXT,
+    artist      TEXT,
+    title       TEXT,
+    album       TEXT,
+    cover_url   TEXT,
+    duration    INTEGER,
+    file_id     TEXT NOT NULL,
+    search_text TEXT,
+    downloads   INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_spotify ON tracks(spotify_id);
+CREATE TABLE IF NOT EXISTS downloads (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER,
+    track_id   INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def _c() -> aiosqlite.Connection:
+    if _db is None:
+        raise RuntimeError("Baza ishga tushirilmagan: db.init() chaqiring")
+    return _db
 
 
 async def init() -> None:
     global _db
-    folder = os.path.dirname(config.DB_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     _db = await aiosqlite.connect(config.DB_PATH)
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL")
-    await _db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id   INTEGER PRIMARY KEY,
-            username  TEXT,
-            full_name TEXT,
-            joined_at INTEGER NOT NULL,
-            active    INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS tracks (
-            key        TEXT PRIMARY KEY,
-            title      TEXT NOT NULL,
-            artist     TEXT NOT NULL,
-            search     TEXT NOT NULL,
-            duration   INTEGER,
-            file_id    TEXT NOT NULL,
-            plays      INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tracks_plays ON tracks(plays DESC);
-        CREATE TABLE IF NOT EXISTS links (
-            url        TEXT PRIMARY KEY,
-            track_key  TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        """
-    )
+    await _db.executescript(SCHEMA)
     await _db.commit()
 
 
 async def close() -> None:
-    if _db:
+    global _db
+    if _db is not None:
         await _db.close()
+        _db = None
 
 
-# ---------- foydalanuvchilar ----------
-async def add_user(user_id: int, username: str | None, full_name: str) -> None:
-    await _db.execute(
-        """INSERT INTO users (user_id, username, full_name, joined_at, active)
-           VALUES (?, ?, ?, ?, 1)
-           ON CONFLICT(user_id) DO UPDATE SET
-               username=excluded.username, full_name=excluded.full_name, active=1""",
-        (user_id, username, full_name, int(time.time())),
-    )
-    await _db.commit()
+async def _one(sql: str, params: tuple = ()) -> dict | None:
+    cur = await _c().execute(sql, params)
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
-async def set_inactive(user_id: int) -> None:
-    await _db.execute("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
-    await _db.commit()
+async def _all(sql: str, params: tuple = ()) -> list[dict]:
+    cur = await _c().execute(sql, params)
+    return [dict(r) for r in await cur.fetchall()]
 
 
 async def _scalar(sql: str, params: tuple = ()) -> int:
-    cur = await _db.execute(sql, params)
-    return (await cur.fetchone())[0]
+    cur = await _c().execute(sql, params)
+    row = await cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
-async def count_users() -> int:
-    return await _scalar("SELECT COUNT(*) FROM users")
-
-
-async def count_active_users() -> int:
-    return await _scalar("SELECT COUNT(*) FROM users WHERE active=1")
-
-
-async def count_new_today() -> int:
-    start = int(time.time()) // 86400 * 86400
-    return await _scalar("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (start,))
-
-
-async def get_active_user_ids() -> list[int]:
-    cur = await _db.execute("SELECT user_id FROM users WHERE active=1")
-    return [r[0] for r in await cur.fetchall()]
-
-
-# ---------- file_id kesh ----------
-async def get_track(key: str):
-    cur = await _db.execute("SELECT * FROM tracks WHERE key=?", (key,))
-    return await cur.fetchone()
-
-
-async def get_tracks(keys: list[str]) -> dict[str, aiosqlite.Row]:
-    if not keys:
-        return {}
-    marks = ",".join("?" * len(keys))
-    cur = await _db.execute(f"SELECT * FROM tracks WHERE key IN ({marks})", keys)
-    return {r["key"]: r for r in await cur.fetchall()}
-
-
-async def save_track(key: str, title: str, artist: str, duration: int | None, file_id: str) -> None:
-    await _db.execute(
-        """INSERT INTO tracks (key, title, artist, search, duration, file_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(key) DO UPDATE SET file_id=excluded.file_id""",
-        (key, title, artist, f"{artist} {title}".lower(), duration, file_id, int(time.time())),
+# --- Foydalanuvchilar -------------------------------------------------------
+async def upsert_user(user_id: int, username: str | None, full_name: str | None) -> None:
+    await _c().execute(
+        """INSERT INTO users(user_id, username, full_name) VALUES(?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+               full_name=excluded.full_name, last_active=CURRENT_TIMESTAMP""",
+        (user_id, username, full_name),
     )
-    await _db.commit()
+    await _c().commit()
 
 
-async def delete_track(key: str) -> None:
-    await _db.execute("DELETE FROM tracks WHERE key=?", (key,))
-    await _db.commit()
+async def all_user_ids() -> list[int]:
+    return [r["user_id"] for r in await _all("SELECT user_id FROM users")]
 
 
-async def inc_plays(key: str) -> None:
-    await _db.execute("UPDATE tracks SET plays = plays + 1 WHERE key=?", (key,))
-    await _db.commit()
+# --- Treklar (file_id kesh) -------------------------------------------------
+async def find_cached(spotify_id: str | None, cache_key: str) -> dict | None:
+    if spotify_id:
+        row = await _one("SELECT * FROM tracks WHERE spotify_id=? ORDER BY id LIMIT 1", (spotify_id,))
+        if row:
+            return row
+    return await _one("SELECT * FROM tracks WHERE cache_key=?", (cache_key,))
 
 
-async def search_tracks(query: str, limit: int = 10):
-    """Bazadagi (kesh) qo'shiqlar ichidan qidirish. Bir xil file_id bir marta chiqadi."""
-    words = re.findall(r"\w+", query.lower())
+async def get_track_by_id(track_id: int) -> dict | None:
+    return await _one("SELECT * FROM tracks WHERE id=?", (track_id,))
+
+
+async def get_track_by_spotify_id(spotify_id: str) -> dict | None:
+    return await _one("SELECT * FROM tracks WHERE spotify_id=? ORDER BY id LIMIT 1", (spotify_id,))
+
+
+async def save_track(*, cache_key: str, spotify_id: str | None, artist: str, title: str,
+                     album: str | None, cover_url: str | None, duration: int | None,
+                     file_id: str) -> int:
+    await _c().execute(
+        """INSERT INTO tracks(cache_key, spotify_id, artist, title, album, cover_url,
+                              duration, file_id, search_text)
+           VALUES(?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(cache_key) DO UPDATE SET file_id=excluded.file_id,
+               spotify_id=COALESCE(excluded.spotify_id, tracks.spotify_id)""",
+        (cache_key, spotify_id, artist, title, album, cover_url, duration, file_id,
+         normalize_key(f"{artist} {title}")),
+    )
+    await _c().commit()
+    row = await _one("SELECT id FROM tracks WHERE cache_key=?", (cache_key,))
+    return row["id"]
+
+
+async def search_tracks(query: str, limit: int = 5) -> list[dict]:
+    words = [w for w in normalize_key(query).split() if w][:6]
     if not words:
         return []
-    cond = " AND ".join(["search LIKE ? ESCAPE '\\'"] * len(words))
-    params = [f"%{w.replace(chr(92), chr(92) * 2).replace('%', chr(92) + '%').replace('_', chr(92) + '_')}%" for w in words]
-    cur = await _db.execute(
-        f"SELECT *, MAX(plays) AS p FROM tracks WHERE {cond} GROUP BY file_id ORDER BY p DESC LIMIT ?",
-        (*params, limit),
-    )
-    return await cur.fetchall()
+    cond = " AND ".join("search_text LIKE ?" for _ in words)
+    params = tuple(f"%{w}%" for w in words) + (limit,)
+    return await _all(f"SELECT * FROM tracks WHERE {cond} ORDER BY downloads DESC, id DESC LIMIT ?", params)
 
 
-async def top_tracks(limit: int = 30):
-    cur = await _db.execute(
-        "SELECT *, MAX(plays) AS p FROM tracks GROUP BY file_id ORDER BY p DESC, created_at DESC LIMIT ?",
-        (limit,),
-    )
-    return await cur.fetchall()
+async def top_tracks(limit: int = 10) -> list[dict]:
+    return await _all("SELECT * FROM tracks ORDER BY downloads DESC, id DESC LIMIT ?", (limit,))
 
 
-async def count_tracks() -> int:
-    return await _scalar("SELECT COUNT(DISTINCT file_id) FROM tracks")
+async def register_download(user_id: int, track_id: int) -> None:
+    await _c().execute("UPDATE tracks SET downloads = downloads + 1 WHERE id=?", (track_id,))
+    await _c().execute("INSERT INTO downloads(user_id, track_id) VALUES(?,?)", (user_id, track_id))
+    await _c().commit()
 
 
-async def total_plays() -> int:
-    return await _scalar("SELECT COALESCE(SUM(plays), 0) FROM tracks")
-
-
-# ---------- havola -> qo'shiq keshi ----------
-async def get_link(url: str) -> str | None:
-    cur = await _db.execute("SELECT track_key FROM links WHERE url=?", (url,))
-    row = await cur.fetchone()
-    return row[0] if row else None
-
-
-async def set_link(url: str, track_key: str) -> None:
-    await _db.execute(
-        "INSERT INTO links (url, track_key, created_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(url) DO UPDATE SET track_key=excluded.track_key",
-        (url, track_key, int(time.time())),
-    )
-    await _db.commit()
+# --- Statistika -------------------------------------------------------------
+async def stats() -> dict:
+    return {
+        "users": await _scalar("SELECT COUNT(*) FROM users"),
+        "active_today": await _scalar("SELECT COUNT(*) FROM users WHERE date(last_active) = date('now')"),
+        "tracks": await _scalar("SELECT COUNT(*) FROM tracks"),
+        "downloads": await _scalar("SELECT COUNT(*) FROM downloads"),
+    }

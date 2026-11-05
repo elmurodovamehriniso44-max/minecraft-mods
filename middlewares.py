@@ -1,54 +1,87 @@
+"""Majburiy obuna (sub-check) middleware'i."""
 import logging
-from typing import Any, Callable
+import time
+from typing import Any, Awaitable, Callable
 
-from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
-
-from services import db, utils
-
-logger = logging.getLogger(__name__)
-
-SUB_TEXT = (
-    "📢 <b>Botdan foydalanish uchun kanalimizga obuna bo'ling!</b>\n\n"
-    "Obuna bo'lgach, «✅ Tekshirish» tugmasini bosing."
+from aiogram import BaseMiddleware, Bot
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQuery, InlineQueryResultsButton, Message, TelegramObject,
 )
 
+import config
+from services import db
 
-class UserTrackerMiddleware(BaseMiddleware):
-    """Har bir foydalanuvchini bazaga yozib boradi (statistika va broadcast uchun)."""
+log = logging.getLogger(__name__)
 
-    def __init__(self) -> None:
-        self._seen: set[int] = set()
+_OK_STATUSES = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}
+_ok_cache: dict[int, float] = {}  # faqat obuna bo'lganlar, 2 daqiqa saqlanadi
+_CACHE_TTL = 120
 
-    async def __call__(self, handler: Callable, event: TelegramObject, data: dict[str, Any]):
-        user = data.get("event_from_user")
-        if user and not user.is_bot and user.id not in self._seen:
-            try:
-                await db.add_user(user.id, user.username, user.full_name)
-                self._seen.add(user.id)
-            except Exception:
-                logger.exception("Foydalanuvchini saqlashda xatolik")
-        return await handler(event, data)
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    now = time.monotonic()
+    if _ok_cache.get(user_id, 0) > now:
+        return True
+    try:
+        member = await bot.get_chat_member(config.REQUIRED_CHANNEL, user_id)
+    except TelegramAPIError as e:
+        # Bot kanalda admin emas yoki kanal noto'g'ri -> foydalanuvchilarni qulflab qo'ymaymiz.
+        log.error("Obuna tekshiruvi xatosi (bot kanalda adminmi?): %s", e)
+        return True
+    ok = member.status in _OK_STATUSES or (
+        member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+    )
+    if ok:
+        _ok_cache[user_id] = now + _CACHE_TTL
+    return ok
+
+
+def _sub_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    if config.CHANNEL_LINK:
+        rows.append([InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=config.CHANNEL_LINK)])
+    rows.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+SUB_TEXT = "🔒 Botdan foydalanish uchun avval kanalimizga obuna bo'ling, so'ng «✅ Tekshirish» tugmasini bosing."
 
 
 class SubscriptionMiddleware(BaseMiddleware):
-    """Kanalga a'zo bo'lmaganlarni to'xtatadi (message va callback uchun)."""
-
-    async def __call__(self, handler: Callable, event: TelegramObject, data: dict[str, Any]):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
         user = data.get("event_from_user")
-        if user is None:
+        if user is None or user.is_bot:
             return await handler(event, data)
-        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+
+        await db.upsert_user(user.id, user.username, user.full_name)
+
+        if not config.REQUIRED_CHANNEL or user.id in config.ADMIN_IDS:
             return await handler(event, data)
-        if await utils.is_subscribed(data["bot"], user.id):
+
+        bot: Bot = data["bot"]
+        if await is_subscribed(bot, user.id):
             return await handler(event, data)
-        try:
-            if isinstance(event, Message):
-                await event.answer(SUB_TEXT, reply_markup=utils.subscribe_kb())
-            elif isinstance(event, CallbackQuery):
-                await event.answer("Avval kanalga obuna bo'ling!", show_alert=True)
+
+        if isinstance(event, Message):
+            await event.answer(SUB_TEXT, reply_markup=_sub_keyboard())
+        elif isinstance(event, CallbackQuery):
+            if event.data == "check_sub":
+                await event.answer("❌ Siz hali obuna bo'lmagansiz!", show_alert=True)
+            else:
+                await event.answer("🔒 Avval kanalga obuna bo'ling.", show_alert=True)
                 if event.message:
-                    await event.message.answer(SUB_TEXT, reply_markup=utils.subscribe_kb())
-        except Exception:
-            logger.exception("Obuna xabarini yuborishda xatolik")
+                    await event.message.answer(SUB_TEXT, reply_markup=_sub_keyboard())
+        elif isinstance(event, InlineQuery):
+            await event.answer(
+                [], cache_time=1, is_personal=True,
+                button=InlineQueryResultsButton(text="📢 Avval kanalga obuna bo'ling", start_parameter="sub"),
+            )
         return None

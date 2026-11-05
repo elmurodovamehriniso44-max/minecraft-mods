@@ -1,88 +1,97 @@
+"""Botni ishga tushiruvchi asosiy fayl."""
 import asyncio
 import logging
+import shutil
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError
-from aiogram.types import ErrorEvent
+from aiogram.types import BotCommand, BotCommandScopeChat
 
 import config
-from handlers import admin, inline, music, start
-from middlewares import SubscriptionMiddleware, UserTrackerMiddleware
-from services import db, utils
+from handlers import routers
+from middlewares import SubscriptionMiddleware
+from services import db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("main")
-
-POLITE = "😔 Kutilmagan xatolik yuz berdi. Iltimos, birozdan so'ng qayta urinib ko'ring."
-
-
-async def health(_: web.Request) -> web.Response:
-    return web.Response(text="OK")
+log = logging.getLogger("main")
 
 
 async def start_health_server() -> web.AppRunner:
-    """Render Web Service port ochiq bo'lishini talab qiladi (+ UptimeRobot ping uchun)."""
+    """Render Web Service port kutadi. UptimeRobot kabi servis shu manzilni ping qilishi mumkin."""
+    async def ok(_):
+        return web.Response(text="OK")
+
     app = web.Application()
-    app.router.add_get("/", health)
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", config.PORT).start()
-    logger.info("Health server :%s portda ishga tushdi", config.PORT)
+    log.info("Health server: port %s", config.PORT)
     return runner
 
 
 async def main() -> None:
-    await db.init()
-    utils.cleanup_workdir()
-    if not utils.find_ffmpeg():
-        logger.error("ffmpeg topilmadi! Render'da Dockerfile ishlating.")
-    logger.info("cookies.txt: %s | player_client: %s", config.COOKIES_FILE or "yo'q", config.YT_PLAYER_CLIENTS)
+    config.validate()
 
-    runner = await start_health_server()
-    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    shutil.rmtree(config.DOWNLOAD_DIR, ignore_errors=True)  # qolib ketgan vaqtinchalik fayllar
+    config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    await db.init()
+
+    if not shutil.which("ffmpeg"):
+        log.warning("ffmpeg tizimda topilmadi! Dockerfile ishlating yoki imageio-ffmpeg zaxirasiga tayaning.")
+    if not (config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET):
+        log.warning("Spotify kalitlari yo'q: havola tahlili ishlamaydi, faqat to'g'ridan-to'g'ri qidiruv bo'ladi.")
+
+    bot = Bot(
+        token=config.BOT_TOKEN,
+        session=AiohttpSession(timeout=300),  # katta audio yuklash uchun
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
 
-    @dp.errors()
-    async def on_error(event: ErrorEvent) -> bool:
-        if isinstance(event.exception, TelegramForbiddenError):
-            return True
-        logger.error("Handlerda xatolik", exc_info=event.exception)
+    sub_mw = SubscriptionMiddleware()
+    dp.message.outer_middleware(sub_mw)
+    dp.callback_query.outer_middleware(sub_mw)
+    dp.inline_query.outer_middleware(sub_mw)
+
+    for r in routers:
+        dp.include_router(r)
+
+    runner = await start_health_server()
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="help", description="Yordam"),
+    ])
+    for admin_id in config.ADMIN_IDS:
         try:
-            upd = event.update
-            if upd.message:
-                await upd.message.answer(POLITE)
-            elif upd.callback_query:
-                await upd.callback_query.answer(POLITE, show_alert=True)
-        except Exception:
-            pass
-        return True
+            await bot.set_my_commands(
+                [BotCommand(command="start", description="Botni ishga tushirish"),
+                 BotCommand(command="help", description="Yordam"),
+                 BotCommand(command="stat", description="Statistika"),
+                 BotCommand(command="broadcast", description="Hammaga xabar yuborish")],
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            log.warning("Admin buyruqlarini o'rnatib bo'lmadi (%s): %s", admin_id, e)
 
-    tracker, sub = UserTrackerMiddleware(), SubscriptionMiddleware()
-    for observer in (dp.message, dp.callback_query):
-        observer.outer_middleware(tracker)
-        observer.outer_middleware(sub)
-
-    dp.include_router(admin.router)
-    dp.include_router(start.router)
-    dp.include_router(music.router)  # umumiy matn handler — start/admin'dan keyin
-    dp.include_router(inline.router)
-
+    me = await bot.get_me()
+    log.info("Bot ishga tushdi: @%s", me.username)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        me = await bot.me()
-        logger.info("Bot ishga tushdi: @%s", me.username)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await bot.session.close()
         await runner.cleanup()
         await db.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot to'xtatildi")
+        log.info("Bot to'xtatildi")

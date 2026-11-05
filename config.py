@@ -1,66 +1,74 @@
+"""Bot sozlamalari. Barcha maxfiy qiymatlar muhit o'zgaruvchilaridan (Render > Environment) o'qiladi."""
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
 
-load_dotenv()
+    load_dotenv()
+except ImportError:  # dotenv ixtiyoriy
+    pass
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def _ids(value: str) -> list[int]:
-    return [int(x) for x in value.replace(" ", "").split(",") if x.lstrip("-").isdigit()]
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
-def _bool(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+def _int_list(raw: str) -> list[int]:
+    result = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            result.append(int(part))
+    return result
 
 
-# ---------- Telegram ----------
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi. .env faylga yoki Render Environment'ga qo'shing.")
+# --- Telegram ---------------------------------------------------------------
+BOT_TOKEN = _env("BOT_TOKEN")
+ADMIN_IDS = _int_list(_env("ADMIN_IDS"))  # masalan: 123456789,987654321
 
-ADMIN_IDS: list[int] = _ids(os.getenv("ADMIN_IDS", ""))
-
-# Majburiy obuna kanali: "@kanal" yoki "-100123456789". Bo'sh bo'lsa tekshiruv o'chadi.
-_raw_channel = os.getenv("CHANNEL_ID", "").strip()
-CHANNEL_ID = int(_raw_channel) if _raw_channel.lstrip("-").isdigit() else _raw_channel
-CHANNEL_URL: str = os.getenv("CHANNEL_URL", "").strip() or (
-    f"https://t.me/{_raw_channel.lstrip('@')}" if _raw_channel.startswith("@") else ""
+# Majburiy obuna kanali: "@kanal_username" yoki -100... ko'rinishidagi ID.
+# Bo'sh qoldirilsa, obuna tekshiruvi o'chiriladi. Bot kanalda ADMIN bo'lishi shart!
+REQUIRED_CHANNEL = _env("REQUIRED_CHANNEL")
+CHANNEL_LINK = _env("REQUIRED_CHANNEL_LINK") or (
+    f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else ""
 )
 
-# ---------- Yo'llar ----------
-WORKDIR: Path = Path(os.getenv("WORKDIR", str(BASE_DIR / "workdir")))
-DB_PATH: str = os.getenv("DB_PATH", str(BASE_DIR / "data" / "bot.db"))
-PORT: int = int(os.getenv("PORT", "10000"))
+# --- Spotify ----------------------------------------------------------------
+SPOTIFY_CLIENT_ID = _env("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = _env("SPOTIFY_CLIENT_SECRET")
+
+# --- Papkalar va baza -------------------------------------------------------
+# Render'da bazani saqlab qolish uchun Persistent Disk ulang va DATA_DIR=/var/data qiling.
+DATA_DIR = Path(_env("DATA_DIR") or str(BASE_DIR / "data"))
+DOWNLOAD_DIR = DATA_DIR / "downloads"
+DB_PATH = DATA_DIR / "bot.db"
+
+# --- yt-dlp -----------------------------------------------------------------
+COOKIES_CANDIDATES = [p for p in (
+    Path(_env("COOKIES_FILE")) if _env("COOKIES_FILE") else None,
+    Path("/etc/secrets/cookies.txt"),   # Render "Secret Files"
+    BASE_DIR / "cookies.txt",
+) if p]
+COOKIES_RUNTIME = DATA_DIR / "cookies_runtime.txt"  # yt-dlp yozishi mumkin, shuning uchun nusxa ishlatiladi
+
+PLAYER_CLIENTS = [c.strip() for c in _env("YT_PLAYER_CLIENTS", "android,web,ios").split(",") if c.strip()]
+MAX_FILE_MB = int(_env("MAX_FILE_MB", "49"))        # Bot API limiti: 50 MB
+MAX_DURATION = int(_env("MAX_DURATION", "1200"))    # soniya (20 daqiqadan uzun videolar o'tkazib yuboriladi)
+MAX_PARALLEL_DOWNLOADS = int(_env("MAX_PARALLEL_DOWNLOADS", "2"))
+ALBUM_MAX_TRACKS = int(_env("ALBUM_MAX_TRACKS", "15"))
+
+# --- Render web-servis porti (health-check uchun) ---------------------------
+PORT = int(_env("PORT", "10000"))
+
+# --- Menyu tugmalari --------------------------------------------------------
+BTN_SEARCH = "🔍 Qo'shiq qidirish"
+BTN_TOP = "🔥 Top musiqalar"
+BTN_ADMIN = "⚙️ Admin panel"
 
 
-def _find_cookies() -> str:
-    """cookies.txt: COOKIES_FILE env -> Render Secret File -> loyiha papkasi."""
-    for p in (os.getenv("COOKIES_FILE", ""), "/etc/secrets/cookies.txt", str(BASE_DIR / "cookies.txt")):
-        if p and os.path.isfile(p):
-            return p
-    return ""
-
-
-COOKIES_FILE: str = _find_cookies()
-
-# YouTube player_client profillari (tartib bilan sinab ko'riladi)
-YT_PLAYER_CLIENTS: list[str] = [
-    c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()
-] or (["web", "android", "ios"] if COOKIES_FILE else ["android", "web", "ios"])
-
-# ---------- Limitlar ----------
-LINK_MAX_DURATION: int = int(os.getenv("LINK_MAX_DURATION", "900"))    # havoladagi video (sek)
-TRACK_MAX_DURATION: int = int(os.getenv("TRACK_MAX_DURATION", "900"))  # to'liq qo'shiq (sek)
-TRACK_MIN_DURATION: int = int(os.getenv("TRACK_MIN_DURATION", "45"))
-MAX_PARALLEL_JOBS: int = int(os.getenv("MAX_PARALLEL_JOBS", "2"))
-MAX_FILE_BYTES: int = 49 * 1024 * 1024
-MP3_BITRATE: str = os.getenv("MP3_BITRATE", "192")
-
-PAGE_SIZE: int = 5
-SEARCH_LIMIT: int = 15
-
-# Faqat tinglash uchun: Telegram saqlash/forward qilishni cheklaydi
-PROTECT_CONTENT: bool = _bool("PROTECT_CONTENT", "true")
+def validate() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
