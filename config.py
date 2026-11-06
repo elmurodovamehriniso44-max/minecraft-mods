@@ -1,76 +1,60 @@
-"""Bot sozlamalari. Barcha maxfiy qiymatlar muhit o'zgaruvchilaridan (Render > Environment) o'qiladi."""
+"""Tizim konfiguratsiyasi (faqat environment variables orqali)."""
+from __future__ import annotations
+
 import os
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Union
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:  # dotenv ixtiyoriy
-    pass
-
-BASE_DIR = Path(__file__).resolve().parent
+ChannelId = Union[int, str]
 
 
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+def _parse_channels(raw: str) -> list[ChannelId]:
+    """'@kanal1, -1001234567890, kanal2' -> ['@kanal1', -1001234567890, '@kanal2']"""
+    channels: list[ChannelId] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.lstrip("-").isdigit():
+            channels.append(int(item))
+        elif item.startswith("https://t.me/"):
+            channels.append("@" + item.rsplit("/", 1)[-1])
+        elif item.startswith("@"):
+            channels.append(item)
+        else:
+            channels.append("@" + item)
+    return channels
 
 
-def _int_list(raw: str) -> list[int]:
-    result = []
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if part.lstrip("-").isdigit():
-            result.append(int(part))
-    return result
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    redis_url: str
+    sponsor_channels: list[ChannelId] = field(default_factory=list)
+    user_agent: str = "mcpe-discovery-bot/1.0 (github.com/your-org/mcpe-discovery-bot)"
+    search_cache_ttl: int = 600
+    download_cache_ttl: int = 900
+    rate_limit_requests: int = 6      # oynada ruxsat etilgan so'rovlar soni
+    rate_limit_window: int = 5        # oyna uzunligi (soniya)
+    search_limit: int = 6
 
 
-# --- Telegram ---------------------------------------------------------------
-BOT_TOKEN = _env("BOT_TOKEN")
-ADMIN_IDS = _int_list(_env("ADMIN_IDS"))  # masalan: 123456789,987654321
+def load_config() -> Config:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi o'rnatilmagan.")
 
-# Majburiy obuna kanali: "@kanal_username" yoki -100... ko'rinishidagi ID.
-# Bo'sh qoldirilsa, obuna tekshiruvi o'chiriladi. Bot kanalda ADMIN bo'lishi shart!
-REQUIRED_CHANNEL = _env("REQUIRED_CHANNEL")
-CHANNEL_LINK = _env("REQUIRED_CHANNEL_LINK") or (
-    f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else ""
-)
-
-# --- Spotify ----------------------------------------------------------------
-SPOTIFY_CLIENT_ID = _env("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = _env("SPOTIFY_CLIENT_SECRET")
-
-# --- Papkalar va baza -------------------------------------------------------
-# Render'da bazani saqlab qolish uchun Persistent Disk ulang va DATA_DIR=/var/data qiling.
-DATA_DIR = Path(_env("DATA_DIR") or str(BASE_DIR / "data"))
-DOWNLOAD_DIR = DATA_DIR / "downloads"
-DB_PATH = DATA_DIR / "bot.db"
-
-# --- yt-dlp -----------------------------------------------------------------
-COOKIES_CANDIDATES = [p for p in (
-    Path(_env("COOKIES_FILE")) if _env("COOKIES_FILE") else None,
-    Path("/etc/secrets/cookies.txt"),   # Render "Secret Files"
-    BASE_DIR / "cookies.txt",
-) if p]
-COOKIES_RUNTIME = DATA_DIR / "cookies_runtime.txt"  # yt-dlp yozishi mumkin, shuning uchun nusxa ishlatiladi
-
-PLAYER_CLIENTS = [c.strip() for c in _env("YT_PLAYER_CLIENTS", "android_vr,web_embedded,android,web,ios").split(",") if c.strip()]
-PROXY_URL = _env("PROXY_URL")   # masalan: http://user:pass@host:port (YouTube bloklasa — rezident proksi)
-AUDIO_QUALITY = _env("AUDIO_QUALITY", "128")        # MP3 bitrate (kbps): past = tezroq va yengilroq
-MAX_FILE_MB = int(_env("MAX_FILE_MB", "49"))        # Bot API limiti: 50 MB
-MAX_DURATION = int(_env("MAX_DURATION", "1200"))    # soniya (20 daqiqadan uzun videolar o'tkazib yuboriladi)
-MAX_PARALLEL_DOWNLOADS = int(_env("MAX_PARALLEL_DOWNLOADS", "2"))
-ALBUM_MAX_TRACKS = int(_env("ALBUM_MAX_TRACKS", "15"))
-
-# --- Render web-servis porti (health-check uchun) ---------------------------
-PORT = int(_env("PORT", "10000"))
-
-# --- Menyu tugmalari --------------------------------------------------------
-BTN_SEARCH = "🔍 Qo'shiq qidirish"
-BTN_TOP = "🔥 Top musiqalar"
-BTN_ADMIN = "⚙️ Admin panel"
-
-
-def validate() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
+    return Config(
+        bot_token=token,
+        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0").strip(),
+        sponsor_channels=_parse_channels(os.getenv("SPONSOR_CHANNELS", "")),
+        user_agent=os.getenv(
+            "MODRINTH_USER_AGENT",
+            "mcpe-discovery-bot/1.0 (github.com/your-org/mcpe-discovery-bot)",
+        ),
+        search_cache_ttl=int(os.getenv("SEARCH_CACHE_TTL", "600")),
+        download_cache_ttl=int(os.getenv("DOWNLOAD_CACHE_TTL", "900")),
+        rate_limit_requests=int(os.getenv("RATE_LIMIT_REQUESTS", "6")),
+        rate_limit_window=int(os.getenv("RATE_LIMIT_WINDOW", "5")),
+        search_limit=int(os.getenv("SEARCH_LIMIT", "6")),
+    )
