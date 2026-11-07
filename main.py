@@ -1,6 +1,17 @@
 """Minecraft Bedrock Addons Telegram boti — ishga tushirish fayli."""
 import asyncio
 import logging
+import os
+from aiohttp import web
+
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    return runner
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -40,6 +51,7 @@ async def main() -> None:
         log.warning("ADMIN_IDS bo'sh! Admin panel hech kimga ochiq bo'lmaydi.")
 
     await db.init_db()
+    health = await start_health_server()
 
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -74,7 +86,7 @@ async def main() -> None:
     finally:
         await db.close_db()
         await bot.session.close()
-
+        await health.cleanup()
 
 if __name__ == "__main__":
     try:
